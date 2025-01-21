@@ -58,7 +58,7 @@ class RemoteCommandExecutor:
                     stdout=slave_fd,
                     stderr=slave_fd,
                     preexec_fn=os.setsid,
-                    shell=True
+                    shell=False
                 )
                 os.close(slave_fd)
             
@@ -72,7 +72,7 @@ class RemoteCommandExecutor:
                     received_data = ""
                     
                     while len(received_data) < total_size:
-                        chunk = client.recv(4096).decode('utf-8')
+                        chunk = client.recv(4096).decode('utf-8', errors='ignore')
                         if not chunk:
                             break
                         received_data += chunk
@@ -87,8 +87,12 @@ class RemoteCommandExecutor:
                         # 터미널 모드 처리
                         self.handle_terminal_mode(client, master_fd, command_data)
                     elif command_type == 'command':
-                        response = self.execute_command(command_data.get('data', ''))
-                        self.send_response(client, response)
+                        if command_data.get('data', '').split()[0] in ['vi', 'vim', 'nano', 'less', 'more', 'cat']:
+                            # 대화형 명령어는 터미널 모드로 처리
+                            self.handle_interactive_command(client, master_fd, command_data.get('data', ''))
+                        else:
+                            response = self.execute_command(command_data.get('data', ''))
+                            self.send_response(client, response)
                     elif command_type in ['upload', 'download', 'download_info']:
                         response = self.handle_file_transfer(command_type, command_data)
                         self.send_response(client, response)
@@ -209,6 +213,30 @@ class RemoteCommandExecutor:
         except Exception as e:
             return {"status": "error", "message": f"파일 전송 실패: {str(e)}"}
 
+    def handle_interactive_command(self, client, master_fd, command):
+        if platform.system() == 'Windows':
+            return self.execute_command(command)
+            
+        try:
+            # 명령어 실행
+            os.write(master_fd, f"{command}\n".encode())
+            
+            while True:
+                readable, _, _ = select.select([master_fd], [], [], 0.1)
+                if master_fd in readable:
+                    try:
+                        output = os.read(master_fd, 1024)
+                        if output:
+                            self.send_response(client, {
+                                "status": "success",
+                                "type": "terminal_output",
+                                "data": output.decode('utf-8', errors='replace')
+                            })
+                    except OSError:
+                        break
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
 class RemoteClient:
     def __init__(self, host='localhost', port=5000):
         self.host = host
@@ -216,6 +244,7 @@ class RemoteClient:
         self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.client.settimeout(60)
         self.terminal_mode = False
+        self.interactive_commands = ['vi', 'vim', 'nano', 'less', 'more', 'cat']
         
     @contextmanager
     def raw_mode(self):
@@ -301,6 +330,7 @@ class RemoteClient:
             print("원격 명령 프롬프트에 오신 것을 환영합니다.")
             print("사용 가능한 명령어:")
             print("- 일반 명령어: 시스템 명령어 실행")
+            print("- vi, nano 등: 대화형 편집기 사용 가능")
             print("- upload <로컬파일> <원격파일>: 파일 업로드")
             print("- download <원격파일> <로컬파일>: 파일 다운로드")
             print("- exit: 프로그램 종료")
@@ -320,7 +350,12 @@ class RemoteClient:
                     elif command.startswith('download '):
                         self.handle_download_command(command)
                     else:
-                        self.send_command(command)
+                        # 대화형 명령어 확인
+                        cmd = command.split()[0]
+                        if cmd in self.interactive_commands:
+                            self.handle_interactive_mode(command)
+                        else:
+                            self.send_command(command)
                     
                 except socket.timeout:
                     print("서버 응답 시간 초과")
@@ -489,6 +524,36 @@ class RemoteClient:
         }
         response = self.send_and_receive(command_data)
         return response.get("message", "").strip()
+
+    def handle_interactive_mode(self, command):
+        print("대화형 모드 시작 (종료: Ctrl+C)")
+        self.terminal_mode = True
+        try:
+            with self.raw_mode():
+                self.send_command(command)
+                while self.terminal_mode:
+                    if platform.system() != 'Windows':
+                        if select.select([sys.stdin], [], [], 0.1)[0]:
+                            char = sys.stdin.read(1)
+                            if char == '\x03':  # Ctrl+C
+                                self.terminal_mode = False
+                                break
+                            self.send_terminal_data(char)
+                    else:
+                        if msvcrt.kbhit():
+                            char = msvcrt.getch()
+                            if char == b'\x03':  # Ctrl+C
+                                self.terminal_mode = False
+                                break
+                            self.send_terminal_data(char.decode(errors='ignore'))
+                    
+                    response = self.receive_response()
+                    if response.get('type') == 'terminal_output':
+                        sys.stdout.write(response.get('data', ''))
+                        sys.stdout.flush()
+        except KeyboardInterrupt:
+            self.terminal_mode = False
+            print("\n대화형 모드 종료")
 
 # 서버 실행 예시
 if __name__ == "__main__":
