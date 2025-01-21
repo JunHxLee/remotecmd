@@ -27,18 +27,72 @@ class RemoteCommandExecutor:
         self.host = host
         self.port = port
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.running = True  # 서버 실행 상태 플래그 추가
         
     def start_server(self):
-        self.server.bind((self.host, self.port))
-        self.server.listen(1)
-        print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
-        
-        while True:
-            client, addr = self.server.accept()
-            print(f"클라이언트 {addr}가 연결되었습니다.")
-            client_thread = threading.Thread(target=self.handle_client, args=(client,))
-            client_thread.start()
+        try:
+            self.server.bind((self.host, self.port))
+            self.server.listen(1)
+            self.server.settimeout(1)  # 타임아웃 설정으로 주기적 체크 가능
+            print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
+            print("서버 종료를 위해서는 'shutdown' 명령어를 사용하세요.")
             
+            # 서버 종료 명령을 감시하는 스레드 시작
+            shutdown_thread = threading.Thread(target=self.check_shutdown_command)
+            shutdown_thread.daemon = True
+            shutdown_thread.start()
+            
+            while self.running:
+                try:
+                    client, addr = self.server.accept()
+                    print(f"클라이언트 {addr}가 연결되었습니다.")
+                    client_thread = threading.Thread(target=self.handle_client, args=(client,))
+                    client_thread.daemon = True
+                    client_thread.start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:  # 정상 종료가 아닌 경우에만 에러 출력
+                        print(f"연결 수락 중 오류 발생: {str(e)}")
+            
+            print("서버가 종료되었습니다.")
+            
+        except Exception as e:
+            print(f"서버 시작 중 오류 발생: {str(e)}")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """서버 자원 정리"""
+        try:
+            self.server.close()
+        except:
+            pass
+    
+    def check_shutdown_command(self):
+        """서버 종료 명령을 감시하는 메서드"""
+        while self.running:
+            try:
+                command = input().strip().lower()
+                if command == 'shutdown':
+                    print("서버를 종료합니다...")
+                    self.shutdown()
+                    break
+            except:
+                pass
+    
+    def shutdown(self):
+        """서버를 안전하게 종료"""
+        self.running = False
+        # 서버 소켓을 닫아서 accept 블록을 해제
+        try:
+            # 로컬호스트로 더미 연결을 생성하여 accept 블록 해제
+            dummy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            dummy_socket.connect((self.host, self.port))
+            dummy_socket.close()
+        except:
+            pass
+    
     def create_pty(self):
         if platform.system() != 'Windows':
             master_fd, slave_fd = pty.openpty()
@@ -62,7 +116,7 @@ class RemoteCommandExecutor:
                 )
                 os.close(slave_fd)
             
-            while True:
+            while self.running:  # 서버 실행 상태 확인
                 try:
                     size_data = client.recv(8).decode('utf-8')
                     if not size_data:
@@ -98,17 +152,25 @@ class RemoteCommandExecutor:
                         self.send_response(client, response)
                     
                 except json.JSONDecodeError as e:
-                    self.send_response(client, {
-                        "status": "error",
-                        "message": f"잘못된 명령어 형식입니다: {str(e)}"
-                    })
+                    if self.running:  # 정상 종료가 아닌 경우에만 에러 응답
+                        self.send_response(client, {
+                            "status": "error",
+                            "message": f"잘못된 명령어 형식입니다: {str(e)}"
+                        })
                     
         except Exception as e:
-            print(f"클라이언트 처리 중 오류 발생: {str(e)}")
+            if self.running:  # 정상 종료가 아닌 경우에만 에러 출력
+                print(f"클라이언트 처리 중 오류 발생: {str(e)}")
         finally:
             if master_fd is not None:
-                os.close(master_fd)
-            client.close()
+                try:
+                    os.close(master_fd)
+                except:
+                    pass
+            try:
+                client.close()
+            except:
+                pass
     
     def handle_terminal_mode(self, client, master_fd, command_data):
         if platform.system() == 'Windows':
@@ -561,7 +623,11 @@ if __name__ == "__main__":
     
     if is_server:
         server = RemoteCommandExecutor()
-        server.start_server()
+        try:
+            server.start_server()
+        except KeyboardInterrupt:
+            print("\n서버를 종료합니다...")
+            server.shutdown()
     else:
         server_host = input("서버 IP를 입력하세요: ")
         client = RemoteClient(host=server_host)
