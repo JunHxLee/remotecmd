@@ -11,7 +11,6 @@ import struct
 import select
 import time
 from contextlib import contextmanager
-import msvcrt  # Windows용
 
 # 운영체제별 모듈 임포트
 if os.name == 'nt':  # Windows
@@ -456,7 +455,7 @@ class RemoteClient:
     def __init__(self, host='localhost', port=5000):
         self.host = host
         self.port = port
-        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = False
         self.command_handlers = {
             'put': self.handle_upload,
@@ -466,17 +465,17 @@ class RemoteClient:
         }
         
     def get_command(self):
-        """사용자 입력을 운영체제별로 처리"""
+        """사용자 입력을 직접 처리"""
         current_path = self.get_current_path()
-        if os.name == 'nt':  # Windows
-            print(f"{current_path}> ", end='', flush=True)
-            command = []
-            while True:
-                import msvcrt
+        print(f"{current_path}> ", end='', flush=True)
+        
+        command = []
+        while True:
+            if os.name == 'nt':  # Windows
                 if msvcrt.kbhit():
                     char = msvcrt.getch()
                     if char == b'\r':  # Enter
-                        print()
+                        print()  # 새 줄
                         break
                     elif char == b'\x03':  # Ctrl+C
                         raise KeyboardInterrupt
@@ -491,13 +490,40 @@ class RemoteClient:
                             print(char_decoded, end='', flush=True)
                         except:
                             pass
-            return ''.join(command).strip()
-        else:  # Linux/Unix
-            return input(f"{current_path}> ").strip()
+            else:  # Unix/Linux
+                try:
+                    # 터미널 설정 저장
+                    fd = sys.stdin.fileno()
+                    old_settings = termios.tcgetattr(fd)
+                    try:
+                        # raw 모드로 변경
+                        tty.setraw(fd)
+                        char = sys.stdin.read(1)
+                        if char == '\n' or char == '\r':  # Enter
+                            print()
+                            break
+                        elif char == '\x03':  # Ctrl+C
+                            raise KeyboardInterrupt
+                        elif char == '\x7f':  # Backspace
+                            if command:
+                                command.pop()
+                                print('\b \b', end='', flush=True)
+                        else:
+                            command.append(char)
+                            print(char, end='', flush=True)
+                    finally:
+                        # 터미널 설정 복구
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except termios.error:
+                    # 터미널이 아닌 경우 일반 입력 사용
+                    line = input()
+                    return line.strip()
+        
+        return ''.join(command).strip()
 
     def connect(self):
         try:
-            self.client.connect((self.host, self.port))
+            self.socket.connect((self.host, self.port))
             print(f"서버 {self.host}:{self.port}에 연결되었습니다.")
             print("원격 명령 프롬프트에 오신 것을 환영합니다. 종료하려면 'exit'를 입력하세요.")
             
@@ -510,14 +536,14 @@ class RemoteClient:
                 if command.strip() == '':
                     continue
                     
-                self.client.send(command.encode())
-                response = self.client.recv(4096).decode()
+                self.socket.send(command.encode())
+                response = self.socket.recv(4096).decode()
                 print(response.rstrip())
                 
         except Exception as e:
             print(f"에러 발생: {str(e)}")
         finally:
-            self.client.close()
+            self.socket.close()
 
     def handle_exit(self, _):
         """종료 처리"""
@@ -608,10 +634,10 @@ class RemoteClient:
         try:
             json_data = json.dumps(command_data)
             size = len(json_data)
-            self.client.sendall(f"{size:08d}".encode())
-            self.client.sendall(json_data.encode())
+            self.socket.sendall(f"{size:08d}".encode())
+            self.socket.sendall(json_data.encode())
             
-            size_data = self.client.recv(8)
+            size_data = self.socket.recv(8)
             if not size_data:
                 return None
                 
@@ -619,7 +645,7 @@ class RemoteClient:
             data = ""
             
             while len(data) < size:
-                chunk = self.client.recv(min(size - len(data), 4096)).decode()
+                chunk = self.socket.recv(min(size - len(data), 4096)).decode()
                 if not chunk:
                     return None
                 data += chunk
