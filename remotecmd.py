@@ -835,6 +835,7 @@ class RemoteClient:
         self.running = False
         self.shell_mode = False
         self.old_terminal_settings = None
+        self.old_windows_mode = None if os.name == 'nt' else None
         self.command_handlers = {
             'upload': self.handle_upload,
             'download': self.handle_download,
@@ -842,22 +843,44 @@ class RemoteClient:
             'exit': self.handle_exit,
             'shell': self.start_shell_mode
         }
+        self.escape_sequences = {
+            b'\x1b[A': b'\x1b[A',  # Up arrow
+            b'\x1b[B': b'\x1b[B',  # Down arrow
+            b'\x1b[C': b'\x1b[C',  # Right arrow
+            b'\x1b[D': b'\x1b[D',  # Left arrow
+            b'\x1b[H': b'\x1b[H',  # Home
+            b'\x1b[F': b'\x1b[F',  # End
+            b'\x1b[3~': b'\x1b[3~',  # Delete
+            b'\x1b[5~': b'\x1b[5~',  # Page Up
+            b'\x1b[6~': b'\x1b[6~',  # Page Down
+        }
 
     def setup_terminal(self):
         """터미널을 raw 모드로 설정"""
         if os.name != 'nt':
+            # Unix/Linux 시스템
             self.old_terminal_settings = termios.tcgetattr(sys.stdin.fileno())
             tty.setraw(sys.stdin.fileno())
         else:
-            # Windows의 경우 가상 터미널 모드 설정
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-10), 0x0001 | 0x0002 | 0x0004)
+            # Windows 시스템
+            self.old_windows_mode = ctypes.c_ulong()
+            handle = ctypes.windll.kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(self.old_windows_mode))
+            # 가상 터미널 모드 설정 (ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_WINDOW_INPUT)
+            mode = 0x0200 | 0x0001 | 0x0008
+            ctypes.windll.kernel32.SetConsoleMode(handle, mode)
+            # 출력 핸들 설정 (ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT)
+            out_handle = ctypes.windll.kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = 0x0004 | 0x0001 | 0x0002
+            ctypes.windll.kernel32.SetConsoleMode(out_handle, mode)
 
     def restore_terminal(self):
         """터미널 설정 복원"""
         if os.name != 'nt' and self.old_terminal_settings:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_terminal_settings)
-        elif os.name == 'nt':
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-10), 0x0007)
+        elif os.name == 'nt' and self.old_windows_mode:
+            handle = ctypes.windll.kernel32.GetStdHandle(-10)
+            ctypes.windll.kernel32.SetConsoleMode(handle, self.old_windows_mode)
 
     def start_shell_mode(self):
         """셸 모드 시작"""
@@ -925,13 +948,37 @@ class RemoteClient:
         try:
             while self.shell_mode:
                 if os.name == 'nt':
+                    # Windows에서의 입력 처리
                     if msvcrt.kbhit():
                         char = msvcrt.getch()
-                        self.send_and_receive({
-                            "type": "input",
-                            "data": char.decode('utf-8', errors='ignore')
-                        })
+                        # 특수 키 시퀀스 처리
+                        if char in (b'\x00', b'\xe0'):  # 확장 키
+                            second_char = msvcrt.getch()
+                            # 방향키 및 특수 키 매핑
+                            key_mapping = {
+                                b'H': b'\x1b[A',  # Up
+                                b'P': b'\x1b[B',  # Down
+                                b'M': b'\x1b[C',  # Right
+                                b'K': b'\x1b[D',  # Left
+                                b'G': b'\x1b[H',  # Home
+                                b'O': b'\x1b[F',  # End
+                                b'S': b'\x1b[3~', # Delete
+                                b'I': b'\x1b[5~', # Page Up
+                                b'Q': b'\x1b[6~'  # Page Down
+                            }
+                            if second_char in key_mapping:
+                                self.send_and_receive({
+                                    "type": "input",
+                                    "data": key_mapping[second_char].decode('utf-8')
+                                })
+                        else:
+                            # 일반 문자 및 컨트롤 문자 처리
+                            self.send_and_receive({
+                                "type": "input",
+                                "data": char.decode('utf-8', errors='ignore')
+                            })
                 else:
+                    # Unix/Linux에서의 입력 처리
                     char = sys.stdin.read(1)
                     if char:
                         self.send_and_receive({
@@ -948,8 +995,15 @@ class RemoteClient:
             while self.shell_mode:
                 response = self.receive_response()
                 if response.get("type") == "output":
-                    sys.stdout.write(response["data"])
-                    sys.stdout.flush()
+                    # ANSI 이스케이프 시퀀스 처리
+                    data = response["data"]
+                    if os.name == 'nt':
+                        # Windows에서 ANSI 이스케이프 시퀀스 처리
+                        sys.stdout.write(data)
+                        sys.stdout.flush()
+                    else:
+                        sys.stdout.write(data)
+                        sys.stdout.flush()
                 elif response.get("type") == "error":
                     print(f"\r\n오류: {response.get('message')}")
                     break
