@@ -363,88 +363,176 @@ class RemoteServer:
         self.host = host
         self.port = port
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.running = True
-        self.sessions = []
-        
+
     def start(self):
         """서버 시작"""
         try:
             self.server.bind((self.host, self.port))
             self.server.listen(5)
-            self.server.settimeout(1)
-            
             print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
-            print("사용 가능한 명령어:")
-            print("- shutdown: 서버 종료")
-            print("- list: 연결된 클라이언트 목록")
-            print("- kill <세션ID>: 특정 클라이언트 연결 종료")
-            
-            shutdown_thread = threading.Thread(target=self.check_shutdown)
-            shutdown_thread.daemon = True
-            shutdown_thread.start()
             
             while self.running:
                 try:
                     client, addr = self.server.accept()
-                    print(f"클라이언트 {addr} 연결됨")
-                    
-                    session = RemoteSession(client, addr)
-                    self.sessions.append(session)
-                    session.start()
+                    print(f"클라이언트 연결됨: {addr[0]}:{addr[1]}")
+                    client_thread = threading.Thread(target=self.handle_client, args=(client, addr))
+                    client_thread.daemon = True
+                    client_thread.start()
                 except socket.timeout:
                     continue
                     
-        except KeyboardInterrupt:
-            print("\n서버를 종료합니다...")
+        except Exception as e:
+            print(f"서버 오류: {str(e)}")
         finally:
             self.cleanup()
-            
-    def check_shutdown(self):
-        """서버 명령어 처리"""
-        while self.running:
-            try:
-                cmd = input().strip().lower()
-                if cmd == 'shutdown':
-                    print("서버를 종료합니다...")
-                    self.running = False
-                elif cmd == 'list':
-                    self.list_sessions()
-                elif cmd.startswith('kill '):
-                    self.kill_session(cmd[5:])
-            except:
-                pass
-                
-    def list_sessions(self):
-        """연결된 클라이언트 목록 출력"""
-        print("\n연결된 클라이언트 목록:")
-        for i, session in enumerate(self.sessions):
-            if session.running:
-                print(f"{i}: {session.addr[0]}:{session.addr[1]}")
-        print()
-                
-    def kill_session(self, session_id):
-        """특정 세션 종료"""
+
+    def handle_client(self, client_socket, addr):
+        """클라이언트 요청 처리"""
         try:
-            idx = int(session_id)
-            if 0 <= idx < len(self.sessions):
-                session = self.sessions[idx]
-                if session.running:
-                    session.close()
-                    print(f"세션 {idx} ({session.addr[0]}:{session.addr[1]}) 종료됨")
-                else:
-                    print("이미 종료된 세션입니다.")
-            else:
-                print("잘못된 세션 ID입니다.")
-        except ValueError:
-            print("올바른 세션 ID를 입력하세요.")
-                
+            while self.running:
+                try:
+                    # 데이터 크기 수신
+                    size_data = client_socket.recv(8)
+                    if not size_data:
+                        break
+                    
+                    size = int(size_data.decode())
+                    data = ""
+                    
+                    # 데이터 수신
+                    while len(data) < size:
+                        chunk = client_socket.recv(min(size - len(data), 4096)).decode()
+                        if not chunk:
+                            break
+                        data += chunk
+                    
+                    if not data:
+                        break
+                    
+                    # 명령어 처리
+                    command = json.loads(data)
+                    command_type = command.get('type')
+                    
+                    print(f"명령어 수신: {command_type}")
+                    
+                    if command_type == 'upload':
+                        self.handle_upload(client_socket, command)
+                    elif command_type == 'download':
+                        self.handle_download(client_socket, command)
+                    elif command_type == 'command':
+                        # 일반 명령어 실행
+                        cmd = command.get('data', '')
+                        print(f"명령어 실행: {cmd}")
+                        output = self.execute_command(cmd)
+                        self.send_response(client_socket, {
+                            "status": "success",
+                            "output": output
+                        })
+                    
+                except json.JSONDecodeError as e:
+                    print(f"잘못된 명령어 형식: {str(e)}")
+                    self.send_response(client_socket, {
+                        "status": "error",
+                        "message": f"잘못된 명령어 형식: {str(e)}"
+                    })
+                    
+        except Exception as e:
+            print(f"클라이언트 처리 중 오류 발생: {str(e)}")
+        finally:
+            print(f"클라이언트 연결 종료: {addr[0]}:{addr[1]}")
+            client_socket.close()
+
+    def execute_command(self, command):
+        """명령어 실행"""
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate()
+            return stdout if stdout else stderr
+        except Exception as e:
+            return f"명령어 실행 오류: {str(e)}"
+
+    def send_response(self, client_socket, response):
+        """응답 전송"""
+        try:
+            json_data = json.dumps(response)
+            size = len(json_data)
+            client_socket.sendall(f"{size:08d}".encode())
+            client_socket.sendall(json_data.encode())
+        except Exception as e:
+            print(f"응답 전송 실패: {str(e)}")
+
+    def handle_upload(self, client_socket, data):
+        """파일 업로드 처리"""
+        try:
+            filename = data.get('filename')
+            content = data.get('content')
+            chunk_info = data.get('chunk_info', {})
+            
+            print(f"파일 업로드 요청: {filename}")
+            
+            # 파일 쓰기 모드 설정
+            mode = 'ab' if chunk_info.get('append_mode') else 'wb'
+            
+            # 파일 저장
+            with open(filename, mode) as f:
+                file_content = base64.b64decode(content)
+                f.write(file_content)
+            
+            # 응답 전송
+            response = {"status": "success", "message": "파일 업로드 성공"}
+            if chunk_info.get('is_last', True):
+                print(f"파일 업로드 완료: {filename}")
+            
+            self.send_response(client_socket, response)
+            
+        except Exception as e:
+            print(f"파일 업로드 실패: {filename} - {str(e)}")
+            self.send_response(client_socket, {
+                "status": "error",
+                "message": f"파일 업로드 실패: {str(e)}"
+            })
+
+    def handle_download(self, client_socket, data):
+        """파일 다운로드 처리"""
+        try:
+            filename = data.get('filename')
+            print(f"파일 다운로드 요청: {filename}")
+            
+            if not os.path.exists(filename):
+                raise FileNotFoundError("파일을 찾을 수 없습니다")
+            
+            file_size = os.path.getsize(filename)
+            print(f"파일 크기: {file_size:,} 바이트")
+            
+            with open(filename, 'rb') as f:
+                content = base64.b64encode(f.read()).decode('utf-8')
+            
+            print(f"파일 다운로드 완료: {filename}")
+            self.send_response(client_socket, {
+                "status": "success",
+                "content": content,
+                "file_size": file_size
+            })
+            
+        except Exception as e:
+            print(f"파일 다운로드 실패: {filename} - {str(e)}")
+            self.send_response(client_socket, {
+                "status": "error",
+                "message": f"파일 다운로드 실패: {str(e)}"
+            })
+
     def cleanup(self):
         """자원 정리"""
         self.running = False
         
-        for session in self.sessions:
-            session.close()
-            
         try:
             self.server.close()
         except:
@@ -456,10 +544,11 @@ class RemoteClient:
         self.host = host
         self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)  # 연결 유지
         self.running = False
         self.command_handlers = {
-            'put': self.handle_upload,
-            'get': self.handle_download,
+            'upload': self.handle_upload,
+            'download': self.handle_download,
             'help': self.show_help,
             'exit': self.handle_exit
         }
@@ -528,20 +617,39 @@ class RemoteClient:
             print("원격 명령 프롬프트에 오신 것을 환영합니다. 종료하려면 'exit'를 입력하세요.")
             
             while True:
-                command = self.get_command()
-                
-                if command.lower() == 'exit':
+                try:
+                    command = self.get_command()
+                    
+                    if not command:
+                        continue
+                    
+                    # 내부 명령어 처리
+                    if command == "exit":
+                        break
+                    elif command == "help":
+                        self.show_help()
+                    elif command.startswith("upload "):
+                        self.handle_upload(command[7:])
+                    elif command.startswith("download "):
+                        self.handle_download(command[9:])
+                    else:
+                        # 일반 명령어를 서버로 전송
+                        self.send_and_receive({
+                            "type": "command",
+                            "data": command
+                        })
+                    
+                except socket.timeout:
+                    print("서버 응답 시간 초과")
+                except KeyboardInterrupt:
+                    print("\n프로그램을 종료합니다...")
+                    break
+                except Exception as e:
+                    print(f"명령어 실행 중 오류 발생: {str(e)}")
                     break
                     
-                if command.strip() == '':
-                    continue
-                    
-                self.socket.send(command.encode())
-                response = self.socket.recv(4096).decode()
-                print(response.rstrip())
-                
         except Exception as e:
-            print(f"에러 발생: {str(e)}")
+            print(f"연결 오류: {str(e)}")
         finally:
             self.socket.close()
 
@@ -553,8 +661,8 @@ class RemoteClient:
         """도움말 표시"""
         print("\n사용 가능한 명령어:")
         print("1. 파일 전송")
-        print("  - put <로컬파일> <원격파일>  : 파일 업로드")
-        print("  - get <원격파일> <로컬파일>  : 파일 다운로드")
+        print("  - upload <로컬파일> <원격파일>  : 파일 업로드")
+        print("  - download <원격파일> <로컬파일>  : 파일 다운로드")
         print("\n2. 시스템 명령어")
         print("  - 모든 일반 시스템 명령어 사용 가능")
         print("\n3. 기타")
@@ -567,7 +675,7 @@ class RemoteClient:
         try:
             parts = args.split()
             if len(parts) != 2:
-                print("사용법: put <로컬파일> <원격파일>")
+                print("사용법: upload <로컬파일> <원격파일>")
                 return True
             
             local_file = parts[0]
@@ -578,25 +686,45 @@ class RemoteClient:
                 return True
             
             file_size = os.path.getsize(local_file)
-            print(f"파일 크기: {file_size:,} 바이트")
+            if file_size == 0:
+                print("빈 파일은 전송할 수 없습니다.")
+                return True
+                
+            print(f"파일 크기: {file_size:,} 바이트", end='\r', flush=True)
+            
+            # 파일을 청크 단위로 읽어서 전송
+            chunk_size = 1024 * 1024  # 1MB
+            uploaded_size = 0
             
             with open(local_file, 'rb') as f:
-                content = base64.b64encode(f.read()).decode('utf-8')
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                        
+                    content = base64.b64encode(chunk).decode('utf-8')
+                    command_data = {
+                        "type": "upload",
+                        "filename": remote_file,
+                        "content": content,
+                        "chunk_info": {
+                            "is_last": len(chunk) < chunk_size,
+                            "append_mode": uploaded_size > 0
+                        }
+                    }
+                    
+                    response = self.send_and_receive(command_data)
+                    if response.get("status") != "success":
+                        raise Exception(response.get("message", "업로드 실패"))
+                    
+                    uploaded_size += len(chunk)
+                    print(f"업로드 중: {uploaded_size:,}/{file_size:,} 바이트 ({uploaded_size/file_size*100:.1f}%)", 
+                          end='\r', flush=True)
             
-            command_data = {
-                "type": "upload",
-                "filename": remote_file,
-                "content": content
-            }
-            
-            response = self.send_and_receive(command_data)
-            if response.get("status") == "success":
-                print(f"파일 '{local_file}' 업로드 완료")
-            else:
-                print(f"업로드 실패: {response.get('message')}")
+            print(f"\n파일 '{local_file}' 업로드 완료")
             
         except Exception as e:
-            print(f"파일 업로드 실패: {str(e)}")
+            print(f"\n파일 업로드 실패: {str(e)}")
         return True
 
     def handle_download(self, args):
@@ -604,7 +732,7 @@ class RemoteClient:
         try:
             parts = args.split()
             if len(parts) != 2:
-                print("사용법: get <원격파일> <로컬파일>")
+                print("사용법: download <원격파일> <로컬파일>")
                 return True
             
             remote_file = parts[0]
@@ -627,32 +755,50 @@ class RemoteClient:
                 
         except Exception as e:
             print(f"파일 다운로드 실패: {str(e)}")
+            if os.path.exists(local_file):
+                os.remove(local_file)  # 실패한 경우 불완전한 파일 삭제
         return True
 
     def send_and_receive(self, command_data):
         """데이터 전송 및 수신"""
         try:
+            # 데이터 전송
             json_data = json.dumps(command_data)
             size = len(json_data)
             self.socket.sendall(f"{size:08d}".encode())
             self.socket.sendall(json_data.encode())
             
+            # 응답 수신
             size_data = self.socket.recv(8)
             if not size_data:
-                return None
-                
+                raise ConnectionError("서버와의 연결이 끊어졌습니다.")
+            
             size = int(size_data.decode())
             data = ""
             
             while len(data) < size:
                 chunk = self.socket.recv(min(size - len(data), 4096)).decode()
                 if not chunk:
-                    return None
+                    raise ConnectionError("서버와의 연결이 끊어졌습니다.")
                 data += chunk
-                
-            return json.loads(data)
-        except:
-            return None
+            
+            response = json.loads(data)
+            if response.get("status") == "success":
+                if "output" in response:
+                    print(response["output"], end="")
+            else:
+                print(f"오류: {response.get('message', '알 수 없는 오류')}")
+            
+            return response
+            
+        except json.JSONDecodeError:
+            raise Exception("서버로부터 잘못된 응답을 받았습니다.")
+        except socket.timeout:
+            raise Exception("서버 응답 시간이 초과되었습니다.")
+        except ConnectionError as e:
+            raise Exception(str(e))
+        except Exception as e:
+            raise Exception(f"통신 오류: {str(e)}")
 
     def get_current_path(self):
         """현재 경로 가져오기"""
@@ -661,17 +807,55 @@ class RemoteClient:
         else:
             return os.path.dirname(os.path.abspath(__file__))
 
+def is_valid_host(host):
+    """호스트명이나 IP 주소의 유효성 검사"""
+    try:
+        # 호스트명이나 IP 주소 확인
+        socket.gethostbyname(host)
+        return True
+    except socket.gaierror:
+        return False
+
 def main():
     """메인 함수"""
     if len(sys.argv) > 1:
-        # 클라이언트 모드
+        # IP 주소나 'client' 파라미터로 클라이언트 모드 실행
         if sys.argv[1] == 'client':
+            # 기존 client 명령어 지원
             print("클라이언트 모드로 시작합니다...")
-            host = input("서버 IP 주소 (기본: localhost): ").strip() or 'localhost'
+            while True:
+                host = input("서버 IP 주소 (기본: localhost): ").strip() or 'localhost'
+                if is_valid_host(host):
+                    break
+                print(f"잘못된 IP 주소 또는 호스트명입니다: {host}")
+            
             client = RemoteClient(host=host)
-            client.connect()
+            try:
+                client.connect()
+            except ConnectionRefusedError:
+                print(f"서버 연결 실패: {host}:{client.port}에서 연결이 거부되었습니다.")
+            except Exception as e:
+                print(f"서버 연결 실패: {str(e)}")
+        else:
+            # IP 주소를 직접 파라미터로 받은 경우
+            host = sys.argv[1]
+            if not is_valid_host(host):
+                print(f"잘못된 IP 주소 또는 호스트명입니다: {host}")
+                print("사용법:")
+                print("  서버 모드: python remotecmd.py")
+                print("  클라이언트 모드: python remotecmd.py <IP주소 또는 호스트명>")
+                return
+            
+            print(f"클라이언트 모드로 시작합니다... (서버: {host})")
+            client = RemoteClient(host=host)
+            try:
+                client.connect()
+            except ConnectionRefusedError:
+                print(f"서버 연결 실패: {host}:{client.port}에서 연결이 거부되었습니다.")
+            except Exception as e:
+                print(f"서버 연결 실패: {str(e)}")
     else:
-        # 서버 모드 (기본)
+        # 파라미터가 없으면 서버 모드로 실행
         print("서버 모드로 시작합니다...")
         server = RemoteServer()
         try:
