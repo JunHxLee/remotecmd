@@ -496,6 +496,15 @@ class RemoteServer:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.running = True
+        self.print_lock = threading.Lock()  # 출력 동기화를 위한 락 추가
+
+    def safe_print(self, message, end='\n'):
+        """스레드 안전한 출력 함수"""
+        with self.print_lock:
+            print(f"\r{message}", end=end, flush=True)
+            if end == '\n':
+                sys.stdout.write('\r')
+                sys.stdout.flush()
 
     def start(self):
         """서버 시작"""
@@ -503,9 +512,9 @@ class RemoteServer:
             self.server.bind((self.host, self.port))
             self.server.listen(5)
             self.server.settimeout(1)  # 타임아웃 설정
-            print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
-            print("사용 가능한 명령어:")
-            print("- shutdown: 서버 종료")
+            self.safe_print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
+            self.safe_print("사용 가능한 명령어:")
+            self.safe_print("- shutdown: 서버 종료")
             
             # 서버 명령어 처리를 위한 스레드 시작
             command_thread = threading.Thread(target=self.handle_server_commands)
@@ -515,7 +524,7 @@ class RemoteServer:
             while self.running:
                 try:
                     client, addr = self.server.accept()
-                    print(f"클라이언트 연결됨: {addr[0]}:{addr[1]}")
+                    self.safe_print(f"클라이언트 연결됨: {addr[0]}:{addr[1]}")
                     client_thread = threading.Thread(target=self.handle_client, args=(client, addr))
                     client_thread.daemon = True
                     client_thread.start()
@@ -523,7 +532,7 @@ class RemoteServer:
                     continue
                     
         except Exception as e:
-            print(f"서버 오류: {str(e)}")
+            self.safe_print(f"서버 오류: {str(e)}")
         finally:
             self.cleanup()
 
@@ -533,11 +542,11 @@ class RemoteServer:
             try:
                 command = input().strip().lower()
                 if command == 'shutdown':
-                    print("\r서버를 종료합니다...", flush=True)
+                    self.safe_print("서버를 종료합니다...")
                     self.running = False
                     break
             except KeyboardInterrupt:
-                print("\r\n서버를 종료합니다...", flush=True)
+                self.safe_print("\n서버를 종료합니다...")
                 self.running = False
                 break
             except:
@@ -556,7 +565,7 @@ class RemoteServer:
             
             # 서버 소켓 종료
             self.server.close()
-            print("\r서버가 종료되었습니다.", flush=True)
+            self.safe_print("서버가 종료되었습니다.")
         except:
             pass
 
@@ -604,7 +613,7 @@ class RemoteServer:
                     command = json.loads(data)
                     command_type = command.get('type')
                     
-                    print(f"명령어 수신: {command_type}")
+                    self.safe_print(f"명령어 수신: {command_type}")
                     
                     if command_type == 'upload':
                         self.handle_upload(client_socket, command)
@@ -613,7 +622,7 @@ class RemoteServer:
                     elif command_type == 'command':
                         # 일반 명령어 실행
                         cmd = command.get('data', '')
-                        print(f"명령어 실행: {cmd}")
+                        self.safe_print(f"명령어 실행: {cmd}")
                         output = self.execute_command(cmd)
                         self.send_response(client_socket, {
                             "status": "success",
@@ -622,7 +631,7 @@ class RemoteServer:
                         })
                     
                 except json.JSONDecodeError as e:
-                    print(f"잘못된 명령어 형식: {str(e)}")
+                    self.safe_print(f"잘못된 명령어 형식: {str(e)}")
                     self.send_response(client_socket, {
                         "status": "error",
                         "message": f"잘못된 명령어 형식: {str(e)}",
@@ -630,9 +639,9 @@ class RemoteServer:
                     })
                     
         except Exception as e:
-            print(f"클라이언트 처리 중 오류 발생: {str(e)}")
+            self.safe_print(f"클라이언트 처리 중 오류 발생: {str(e)}")
         finally:
-            print(f"클라이언트 연결 종료: {addr[0]}:{addr[1]}")
+            self.safe_print(f"클라이언트 연결 종료: {addr[0]}:{addr[1]}")
             client_socket.close()
 
     def execute_command(self, command):
@@ -667,7 +676,7 @@ class RemoteServer:
             content = data.get('content')
             chunk_info = data.get('chunk_info', {})
             
-            print(f"파일 업로드 요청: {filename}")
+            self.safe_print(f"파일 업로드 요청: {filename}")
             
             # 파일 쓰기 모드 설정
             mode = 'ab' if chunk_info.get('append_mode') else 'wb'
@@ -680,12 +689,12 @@ class RemoteServer:
             # 응답 전송
             response = {"status": "success", "message": "파일 업로드 성공"}
             if chunk_info.get('is_last', True):
-                print(f"파일 업로드 완료: {filename}")
+                self.safe_print(f"파일 업로드 완료: {filename}")
             
             self.send_response(client_socket, response)
             
         except Exception as e:
-            print(f"파일 업로드 실패: {filename} - {str(e)}")
+            self.safe_print(f"파일 업로드 실패: {filename} - {str(e)}")
             self.send_response(client_socket, {
                 "status": "error",
                 "message": f"파일 업로드 실패: {str(e)}"
@@ -695,18 +704,18 @@ class RemoteServer:
         """파일 다운로드 처리"""
         try:
             filename = data.get('filename')
-            print(f"파일 다운로드 요청: {filename}")
+            self.safe_print(f"파일 다운로드 요청: {filename}")
             
             if not os.path.exists(filename):
                 raise FileNotFoundError("파일을 찾을 수 없습니다")
             
             file_size = os.path.getsize(filename)
-            print(f"파일 크기: {file_size:,} 바이트")
+            self.safe_print(f"파일 크기: {file_size:,} 바이트")
             
             with open(filename, 'rb') as f:
                 content = base64.b64encode(f.read()).decode('utf-8')
             
-            print(f"파일 다운로드 완료: {filename}")
+            self.safe_print(f"파일 다운로드 완료: {filename}")
             self.send_response(client_socket, {
                 "status": "success",
                 "content": content,
@@ -714,7 +723,7 @@ class RemoteServer:
             })
             
         except Exception as e:
-            print(f"파일 다운로드 실패: {filename} - {str(e)}")
+            self.safe_print(f"파일 다운로드 실패: {filename} - {str(e)}")
             self.send_response(client_socket, {
                 "status": "error",
                 "message": f"파일 다운로드 실패: {str(e)}"
