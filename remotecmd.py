@@ -52,6 +52,7 @@ class PtyHandler:
         self.slave_fd = None
         self.process = None
         self.is_windows = os.name == 'nt'
+        self.buffer = b''
         
     def create(self):
         """PTY 생성"""
@@ -59,7 +60,7 @@ class PtyHandler:
             self.master_fd, self.slave_fd = pty.openpty()
             # PTY 설정
             attr = termios.tcgetattr(self.slave_fd)
-            attr[3] = attr[3] & ~termios.ECHO
+            attr[3] = attr[3] & ~termios.ECHO  # Echo 끄기
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, attr)
             return True
         return False
@@ -70,12 +71,14 @@ class PtyHandler:
             shell = 'cmd.exe' if self.is_windows else '/bin/bash'
             
         if self.is_windows:
+            # Windows에서는 subprocess를 통해 실행
             self.process = subprocess.Popen(
                 shell,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                shell=True
+                shell=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
             )
             return True
         else:
@@ -97,34 +100,40 @@ class PtyHandler:
             )
             os.close(self.slave_fd)
             return True
-        
-    def resize(self, rows, cols):
-        """터미널 크기 조정"""
-        if not self.is_windows and self.master_fd:
-            winsize = struct.pack('HHHH', rows, cols, 0, 0)
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
             
     def read(self, size=1024):
         """데이터 읽기"""
         if self.is_windows:
             if self.process:
                 try:
-                    return self.process.stdout.read1(size)
+                    # Windows에서는 stdout에서 직접 읽기
+                    data = self.process.stdout.read1(size)
+                    if data:
+                        return data
+                    # 에러 출력도 확인
+                    return self.process.stderr.read1(size)
                 except:
                     return None
         else:
             if self.master_fd:
                 try:
-                    return os.read(self.master_fd, size)
+                    # Unix/Linux에서는 master_fd에서 읽기
+                    data = os.read(self.master_fd, size)
+                    if data:
+                        return data
                 except:
                     return None
         return None
         
     def write(self, data):
         """데이터 쓰기"""
+        if isinstance(data, str):
+            data = data.encode()
+            
         if self.is_windows:
             if self.process:
                 try:
+                    # Windows에서는 stdin에 직접 쓰기
                     self.process.stdin.write(data)
                     self.process.stdin.flush()
                     return len(data)
@@ -133,11 +142,53 @@ class PtyHandler:
         else:
             if self.master_fd:
                 try:
+                    # Unix/Linux에서는 master_fd에 쓰기
                     return os.write(self.master_fd, data)
                 except:
                     return None
         return None
+
+    def handle_control_chars(self, data):
+        """컨트롤 문자 처리"""
+        # 컨트롤 문자 처리 로직
+        control_chars = {
+            b'\x03': self.handle_ctrl_c,  # Ctrl+C
+            b'\x04': self.handle_ctrl_d,  # Ctrl+D
+            b'\x1a': self.handle_ctrl_z,  # Ctrl+Z
+        }
         
+        if data in control_chars:
+            return control_chars[data]()
+        return data
+    
+    def handle_ctrl_c(self):
+        """Ctrl+C 처리"""
+        if self.is_windows:
+            os.kill(self.process.pid, signal.CTRL_C_EVENT)
+        else:
+            os.kill(self.process.pid, signal.SIGINT)
+        return b'^C\n'
+    
+    def handle_ctrl_d(self):
+        """Ctrl+D 처리"""
+        if not self.is_windows:
+            return b'\x04'
+        return b''
+    
+    def handle_ctrl_z(self):
+        """Ctrl+Z 처리"""
+        if self.is_windows:
+            os.kill(self.process.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(self.process.pid, signal.SIGTSTP)
+        return b'^Z\n'
+        
+    def resize(self, rows, cols):
+        """터미널 크기 조정"""
+        if not self.is_windows and self.master_fd:
+            winsize = struct.pack('HHHH', rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            
     def close(self):
         """세션 종료"""
         if self.process:
@@ -216,7 +267,11 @@ class RemoteSession:
     def handle_shell_input(self, command):
         """셸 입력 처리"""
         if command.get('type') == 'input':
-            self.pty.write(command['data'].encode())
+            data = command['data'].encode() if isinstance(command['data'], str) else command['data']
+            # 컨트롤 문자 처리
+            processed_data = self.pty.handle_control_chars(data)
+            if processed_data:
+                self.pty.write(processed_data)
         elif command.get('type') == 'resize':
             self.pty.resize(command['rows'], command['cols'])
             
@@ -229,17 +284,33 @@ class RemoteSession:
                     if self.pty.master_fd in readable:
                         data = self.pty.read(4096)
                         if data:
-                            self.send_data({
-                                'type': 'output',
-                                'data': data.decode('utf-8', errors='replace')
-                            })
+                            try:
+                                decoded_data = data.decode('utf-8', errors='replace')
+                                self.send_data({
+                                    'type': 'output',
+                                    'data': decoded_data
+                                })
+                            except UnicodeDecodeError:
+                                # 디코딩 오류 발생 시 raw 바이트로 전송
+                                self.send_data({
+                                    'type': 'output',
+                                    'data': str(data)
+                                })
                 else:
                     data = self.pty.read(4096)
                     if data:
-                        self.send_data({
-                            'type': 'output',
-                            'data': data.decode('utf-8', errors='replace')
-                        })
+                        try:
+                            decoded_data = data.decode('utf-8', errors='replace')
+                            self.send_data({
+                                'type': 'output',
+                                'data': decoded_data
+                            })
+                        except UnicodeDecodeError:
+                            # 디코딩 오류 발생 시 raw 바이트로 전송
+                            self.send_data({
+                                'type': 'output',
+                                'data': str(data)
+                            })
                     time.sleep(0.01)
         except:
             self.shell_mode = False
@@ -442,6 +513,9 @@ class RemoteServer:
     def handle_client(self, client_socket, addr):
         """클라이언트 요청 처리"""
         try:
+            # 초기 프롬프트 전송
+            self.send_prompt(client_socket)
+            
             while self.running:
                 try:
                     # 데이터 크기 수신
@@ -479,14 +553,16 @@ class RemoteServer:
                         output = self.execute_command(cmd)
                         self.send_response(client_socket, {
                             "status": "success",
-                            "output": output
+                            "output": output,
+                            "prompt": self.get_prompt()
                         })
                     
                 except json.JSONDecodeError as e:
                     print(f"잘못된 명령어 형식: {str(e)}")
                     self.send_response(client_socket, {
                         "status": "error",
-                        "message": f"잘못된 명령어 형식: {str(e)}"
+                        "message": f"잘못된 명령어 형식: {str(e)}",
+                        "prompt": self.get_prompt()
                     })
                     
         except Exception as e:
@@ -580,6 +656,17 @@ class RemoteServer:
                 "message": f"파일 다운로드 실패: {str(e)}"
             })
 
+    def get_prompt(self):
+        """현재 서버 프롬프트 반환"""
+        return f"{os.getcwd()}>"
+
+    def send_prompt(self, client_socket):
+        """프롬프트 전송"""
+        self.send_response(client_socket, {
+            "status": "success",
+            "prompt": self.get_prompt()
+        })
+
 class RemoteClient:
     """클라이언트 클래스"""
     def __init__(self, host='localhost', port=5000):
@@ -595,72 +682,22 @@ class RemoteClient:
             'exit': self.handle_exit
         }
         
-    def get_command(self):
-        """사용자 입력을 직접 처리"""
-        current_path = self.get_current_path()
-        print(f"{current_path}> ", end='', flush=True)
-        
-        command = []
-        while True:
-            if os.name == 'nt':  # Windows
-                if msvcrt.kbhit():
-                    char = msvcrt.getch()
-                    if char == b'\r':  # Enter
-                        print()  # 새 줄
-                        break
-                    elif char == b'\x03':  # Ctrl+C
-                        raise KeyboardInterrupt
-                    elif char == b'\x08':  # Backspace
-                        if command:
-                            command.pop()
-                            print('\b \b', end='', flush=True)
-                    else:
-                        try:
-                            char_decoded = char.decode('utf-8')
-                            command.append(char_decoded)
-                            print(char_decoded, end='', flush=True)
-                        except:
-                            pass
-            else:  # Unix/Linux
-                try:
-                    # 터미널 설정 저장
-                    fd = sys.stdin.fileno()
-                    old_settings = termios.tcgetattr(fd)
-                    try:
-                        # raw 모드로 변경
-                        tty.setraw(fd)
-                        char = sys.stdin.read(1)
-                        if char == '\n' or char == '\r':  # Enter
-                            print()
-                            break
-                        elif char == '\x03':  # Ctrl+C
-                            raise KeyboardInterrupt
-                        elif char == '\x7f':  # Backspace
-                            if command:
-                                command.pop()
-                                print('\b \b', end='', flush=True)
-                        else:
-                            command.append(char)
-                            print(char, end='', flush=True)
-                    finally:
-                        # 터미널 설정 복구
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except termios.error:
-                    # 터미널이 아닌 경우 일반 입력 사용
-                    line = input()
-                    return line.strip()
-        
-        return ''.join(command).strip()
-
     def connect(self):
         try:
             self.socket.connect((self.host, self.port))
             print(f"서버 {self.host}:{self.port}에 연결되었습니다.")
-            print("원격 명령 프롬프트에 오신 것을 환영합니다. 종료하려면 'exit'를 입력하세요.")
+            print("원격 명령 프롬프트에 오신 것을 환영합니다.")
+            print("- 종료: exit")
+            print("- 도움말: help")
+            print("- 로컬 명령어: !명령어 (예: !dir)")
+            
+            # 초기 프롬프트 수신
+            response = self.receive_response()
+            current_prompt = response.get("prompt", "")
             
             while True:
                 try:
-                    command = self.get_command()
+                    command = input(current_prompt).strip()
                     
                     if not command:
                         continue
@@ -674,12 +711,15 @@ class RemoteClient:
                         self.handle_upload(command[7:])
                     elif command.startswith("download "):
                         self.handle_download(command[9:])
+                    elif command.startswith("!"):  # 로컬 명령어 처리
+                        self.execute_local_command(command[1:])
                     else:
                         # 일반 명령어를 서버로 전송
-                        self.send_and_receive({
+                        response = self.send_and_receive({
                             "type": "command",
                             "data": command
                         })
+                        current_prompt = response.get("prompt", current_prompt)
                     
                 except socket.timeout:
                     print("서버 응답 시간 초과")
@@ -695,6 +735,43 @@ class RemoteClient:
         finally:
             self.socket.close()
 
+    def execute_local_command(self, command):
+        """로컬 명령어 실행"""
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate()
+            
+            if stdout:
+                print(stdout, end='')
+            if stderr:
+                print(stderr, end='')
+                
+        except Exception as e:
+            print(f"로컬 명령어 실행 실패: {str(e)}")
+
+    def receive_response(self):
+        """서버 응답 수신"""
+        size_data = self.socket.recv(8)
+        if not size_data:
+            raise ConnectionError("서버와의 연결이 끊어졌습니다.")
+        
+        size = int(size_data.decode())
+        data = ""
+        
+        while len(data) < size:
+            chunk = self.socket.recv(min(size - len(data), 4096)).decode()
+            if not chunk:
+                raise ConnectionError("서버와의 연결이 끊어졌습니다.")
+            data += chunk
+        
+        return json.loads(data)
+
     def handle_exit(self, _):
         """종료 처리"""
         return False
@@ -706,7 +783,8 @@ class RemoteClient:
         print("  - upload <로컬파일> <원격파일>  : 파일 업로드")
         print("  - download <원격파일> <로컬파일>  : 파일 다운로드")
         print("\n2. 시스템 명령어")
-        print("  - 모든 일반 시스템 명령어 사용 가능")
+        print("  - 원격 명령어: 직접 입력 (예: dir)")
+        print("  - 로컬 명령어: ! 접두사 사용 (예: !dir)")
         print("\n3. 기타")
         print("  - help  : 이 도움말 보기")
         print("  - exit  : 프로그램 종료\n")
