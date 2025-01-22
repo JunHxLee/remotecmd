@@ -55,16 +55,45 @@ class PtyHandler:
         self.is_windows = os.name == 'nt'
         self.buffer = b''
         self.interactive_commands = {'cat', 'nano', 'vi', 'vim', 'less', 'more', 'tail -f'}
+        self.escape_sequences = {
+            b'\x1b[A': b'\x1b[A',  # Up arrow
+            b'\x1b[B': b'\x1b[B',  # Down arrow
+            b'\x1b[C': b'\x1b[C',  # Right arrow
+            b'\x1b[D': b'\x1b[D',  # Left arrow
+            b'\x1b[H': b'\x1b[H',  # Home
+            b'\x1b[F': b'\x1b[F',  # End
+            b'\x1b[3~': b'\x1b[3~',  # Delete
+            b'\x1b[5~': b'\x1b[5~',  # Page Up
+            b'\x1b[6~': b'\x1b[6~',  # Page Down
+        }
         
     def create(self):
         """PTY 생성"""
         if not self.is_windows:
             self.master_fd, self.slave_fd = pty.openpty()
+            
             # PTY 설정
             attr = termios.tcgetattr(self.slave_fd)
-            attr[3] = attr[3] & ~termios.ECHO  # Echo 끄기
-            attr[0] = attr[0] | termios.ICRNL   # CR -> NL 변환
-            attr[1] = attr[1] | termios.ONLCR   # NL -> CR-NL 변환
+            
+            # 입력 모드 설정
+            attr[0] = attr[0] | termios.ICRNL | termios.IXON | termios.IXANY | termios.IMAXBEL
+            attr[0] = attr[0] & ~termios.IGNBRK & ~termios.BRKINT & ~termios.PARMRK & ~termios.ISTRIP & ~termios.INLCR & ~termios.IGNCR
+            
+            # 출력 모드 설정
+            attr[1] = attr[1] | termios.OPOST | termios.ONLCR
+            
+            # 제어 모드 설정
+            attr[2] = attr[2] | termios.CREAD | termios.CS8
+            attr[2] = attr[2] & ~termios.PARENB & ~termios.PARODD & ~termios.HUPCL
+            
+            # 로컬 모드 설정
+            attr[3] = attr[3] | termios.ICANON | termios.ISIG | termios.IEXTEN | termios.ECHOE | termios.ECHOK
+            attr[3] = attr[3] & ~termios.ECHO & ~termios.ECHONL
+            
+            # 특수 문자 설정
+            attr[6][termios.VMIN] = 1
+            attr[6][termios.VTIME] = 0
+            
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, attr)
             
             # 터미널 크기 설정
@@ -73,10 +102,18 @@ class PtyHandler:
             return True
         return False
         
-    def spawn(self, shell=None):
+    def spawn(self, env=None):
         """셸 프로세스 생성"""
-        if not shell:
-            shell = 'cmd.exe' if self.is_windows else '/bin/bash'
+        if not env:
+            env = {
+                'TERM': 'xterm-256color',
+                'PATH': os.environ.get('PATH', ''),
+                'HOME': os.environ.get('HOME', ''),
+                'SHELL': '/bin/bash' if not self.is_windows else 'cmd.exe',
+                'LANG': os.environ.get('LANG', 'en_US.UTF-8'),
+                'COLUMNS': str(TerminalSize.get_terminal_size()[1]),
+                'LINES': str(TerminalSize.get_terminal_size()[0])
+            }
             
         if self.is_windows:
             # Windows에서는 subprocess를 통해 실행
@@ -84,27 +121,20 @@ class PtyHandler:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
             self.process = subprocess.Popen(
-                shell,
+                env['SHELL'],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=True,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                 startupinfo=startupinfo,
-                bufsize=0
+                bufsize=0,
+                env=env
             )
             return True
         else:
-            env = {
-                'TERM': 'xterm-256color',
-                'PATH': os.environ.get('PATH', ''),
-                'HOME': os.environ.get('HOME', ''),
-                'SHELL': shell,
-                'LANG': os.environ.get('LANG', 'en_US.UTF-8')
-            }
-            
             self.process = subprocess.Popen(
-                shell,
+                env['SHELL'],
                 stdin=self.slave_fd,
                 stdout=self.slave_fd,
                 stderr=self.slave_fd,
@@ -182,13 +212,21 @@ class PtyHandler:
 
     def handle_control_chars(self, data):
         """컨트롤 문자 처리"""
-        # 컨트롤 문자 처리 로직
+        # ESC 시퀀스 처리
+        if data.startswith(b'\x1b'):
+            for seq in self.escape_sequences:
+                if data.startswith(seq):
+                    return seq
+            return data
+            
+        # 일반 컨트롤 문자 처리
         control_chars = {
-            b'\x03': self.handle_ctrl_c,  # Ctrl+C
-            b'\x04': self.handle_ctrl_d,  # Ctrl+D
-            b'\x1a': self.handle_ctrl_z,  # Ctrl+Z
-            b'\x1b': lambda: b'\x1b',     # ESC
-            b'\r': lambda: b'\r\n' if not self.is_windows else b'\r\n'  # Enter
+            b'\x03': self.handle_ctrl_c,    # Ctrl+C
+            b'\x04': self.handle_ctrl_d,    # Ctrl+D
+            b'\x1a': self.handle_ctrl_z,    # Ctrl+Z
+            b'\x7f': lambda: b'\x7f',       # Backspace
+            b'\r': lambda: b'\r\n' if not self.is_windows else b'\r\n',  # Enter
+            b'\t': lambda: b'\t',           # Tab
         }
         
         if data in control_chars:
@@ -201,7 +239,7 @@ class PtyHandler:
             self.process.send_signal(signal.CTRL_C_EVENT)
         else:
             os.kill(self.process.pid, signal.SIGINT)
-        return b'^C\n'
+        return b'\x03'
     
     def handle_ctrl_d(self):
         """Ctrl+D 처리"""
@@ -215,7 +253,7 @@ class PtyHandler:
             self.process.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             os.kill(self.process.pid, signal.SIGTSTP)
-        return b'^Z\n'
+        return b'\x1a'
         
     def resize(self, rows, cols):
         """터미널 크기 조정"""
@@ -285,20 +323,48 @@ class RemoteSession:
     def start_shell_mode(self):
         """셸 모드 시작"""
         self.shell_mode = True
-        if self.pty.create() and self.pty.spawn():
-            # 입출력 스레드 시작
-            output_thread = threading.Thread(target=self.handle_shell_output)
-            output_thread.daemon = True
-            output_thread.start()
-            
-            self.send_data({
-                'type': 'shell',
-                'status': 'started'
-            })
+        if self.pty.create():
+            # 환경 변수 설정
+            env = {
+                'TERM': 'xterm-256color',
+                'PATH': os.environ.get('PATH', ''),
+                'HOME': os.environ.get('HOME', ''),
+                'SHELL': '/bin/bash' if not self.pty.is_windows else 'cmd.exe',
+                'LANG': os.environ.get('LANG', 'en_US.UTF-8'),
+                'COLUMNS': str(TerminalSize.get_terminal_size()[1]),
+                'LINES': str(TerminalSize.get_terminal_size()[0])
+            }
+
+            # PTY 설정
+            if not self.pty.is_windows:
+                # Unix/Linux 시스템에서 PTY 설정
+                attr = termios.tcgetattr(self.pty.slave_fd)
+                attr[0] = attr[0] | termios.ICRNL | termios.IXON  # 입력 모드 설정
+                attr[1] = attr[1] | termios.OPOST | termios.ONLCR  # 출력 모드 설정
+                attr[2] = attr[2] | termios.CS8  # 제어 모드 설정
+                attr[3] = attr[3] | (termios.ICANON | termios.ISIG | termios.IEXTEN)  # 로컬 모드 설정
+                termios.tcsetattr(self.pty.slave_fd, termios.TCSANOW, attr)
+
+            if self.pty.spawn(env=env):
+                # 입출력 스레드 시작
+                output_thread = threading.Thread(target=self.handle_shell_output)
+                output_thread.daemon = True
+                output_thread.start()
+                
+                self.send_data({
+                    'type': 'shell',
+                    'status': 'started'
+                })
+            else:
+                self.send_data({
+                    'type': 'error',
+                    'message': '셸 시작 실패'
+                })
+                self.shell_mode = False
         else:
             self.send_data({
                 'type': 'error',
-                'message': '셸 시작 실패'
+                'message': 'PTY 생성 실패'
             })
             self.shell_mode = False
             
@@ -306,32 +372,44 @@ class RemoteSession:
         """셸 입력 처리"""
         if command.get('type') == 'input':
             data = command['data'].encode() if isinstance(command['data'], str) else command['data']
-            # 컨트롤 문자 처리
-            processed_data = self.pty.handle_control_chars(data)
-            if processed_data:
-                self.pty.write(processed_data)
-                # 대화형 명령어 처리를 위한 즉시 출력
-                if self.pty.is_windows:
-                    time.sleep(0.1)  # Windows에서 출력 동기화를 위한 짧은 대기
-                    output = self.pty.read(4096)
-                    if output:
-                        try:
-                            decoded_output = output.decode('utf-8', errors='replace')
-                            self.send_data({
-                                'type': 'output',
-                                'data': decoded_output
-                            })
-                        except UnicodeDecodeError:
-                            self.send_data({
-                                'type': 'output',
-                                'data': str(output)
-                            })
+            
+            # 특수 키 시퀀스 처리
+            if data.startswith(b'\x1b'):  # ESC 시퀀스
+                # 방향키, 기능키 등의 처리
+                self.pty.write(data)
+            else:
+                # 일반 입력 및 컨트롤 문자 처리
+                processed_data = self.pty.handle_control_chars(data)
+                if processed_data:
+                    self.pty.write(processed_data)
+                    
+            # 즉시 출력 처리
+            if self.pty.is_windows:
+                time.sleep(0.01)  # Windows에서 출력 동기화
+            output = self.pty.read(4096)
+            if output:
+                try:
+                    decoded_output = output.decode('utf-8', errors='replace')
+                    self.send_data({
+                        'type': 'output',
+                        'data': decoded_output
+                    })
+                except UnicodeDecodeError:
+                    self.send_data({
+                        'type': 'output',
+                        'data': str(output)
+                    })
+                    
         elif command.get('type') == 'resize':
             # 터미널 크기 조정
             rows = command.get('rows', 24)
             cols = command.get('cols', 80)
             self.pty.resize(rows, cols)
-            
+            # 환경 변수 업데이트
+            if not self.pty.is_windows and self.pty.process:
+                os.environ['COLUMNS'] = str(cols)
+                os.environ['LINES'] = str(rows)
+
     def handle_shell_output(self):
         """셸 출력 처리"""
         try:
@@ -497,11 +575,14 @@ class RemoteServer:
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.running = True
         self.print_lock = threading.Lock()  # 출력 동기화를 위한 락 추가
+        self.clients = {}  # 클라이언트 정보 저장 딕셔너리
 
-    def safe_print(self, message, end='\n'):
+    def safe_print(self, message, end='\n', client_info=None):
         """스레드 안전한 출력 함수"""
         with self.print_lock:
-            print(f"\r{message}", end=end, flush=True)
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            client_str = f"[{client_info}] " if client_info else ""
+            print(f"\r[{timestamp}] {client_str}{message}", end=end, flush=True)
             if end == '\n':
                 sys.stdout.write('\r')
                 sys.stdout.flush()
@@ -585,6 +666,8 @@ class RemoteServer:
 
     def handle_client(self, client_socket, addr):
         """클라이언트 요청 처리"""
+        client_info = f"{addr[0]}:{addr[1]}"
+        self.clients[client_socket] = client_info
         try:
             # 초기 프롬프트 전송
             self.send_prompt(client_socket)
@@ -613,16 +696,16 @@ class RemoteServer:
                     command = json.loads(data)
                     command_type = command.get('type')
                     
-                    self.safe_print(f"명령어 수신: {command_type}")
+                    self.safe_print(f"명령어 수신: {command_type}", client_info=client_info)
                     
                     if command_type == 'upload':
-                        self.handle_upload(client_socket, command)
+                        self.handle_upload(client_socket, command, client_info)
                     elif command_type == 'download':
-                        self.handle_download(client_socket, command)
+                        self.handle_download(client_socket, command, client_info)
                     elif command_type == 'command':
                         # 일반 명령어 실행
                         cmd = command.get('data', '')
-                        self.safe_print(f"명령어 실행: {cmd}")
+                        self.safe_print(f"명령어 실행: {cmd}", client_info=client_info)
                         output = self.execute_command(cmd)
                         self.send_response(client_socket, {
                             "status": "success",
@@ -631,7 +714,7 @@ class RemoteServer:
                         })
                     
                 except json.JSONDecodeError as e:
-                    self.safe_print(f"잘못된 명령어 형식: {str(e)}")
+                    self.safe_print(f"잘못된 명령어 형식: {str(e)}", client_info=client_info)
                     self.send_response(client_socket, {
                         "status": "error",
                         "message": f"잘못된 명령어 형식: {str(e)}",
@@ -639,9 +722,11 @@ class RemoteServer:
                     })
                     
         except Exception as e:
-            self.safe_print(f"클라이언트 처리 중 오류 발생: {str(e)}")
+            self.safe_print(f"클라이언트 처리 중 오류 발생: {str(e)}", client_info=client_info)
         finally:
-            self.safe_print(f"클라이언트 연결 종료: {addr[0]}:{addr[1]}")
+            self.safe_print(f"클라이언트 연결 종료", client_info=client_info)
+            if client_socket in self.clients:
+                del self.clients[client_socket]
             client_socket.close()
 
     def execute_command(self, command):
@@ -669,14 +754,14 @@ class RemoteServer:
         except Exception as e:
             print(f"응답 전송 실패: {str(e)}")
 
-    def handle_upload(self, client_socket, data):
+    def handle_upload(self, client_socket, data, client_info):
         """파일 업로드 처리"""
         try:
             filename = data.get('filename')
             content = data.get('content')
             chunk_info = data.get('chunk_info', {})
             
-            self.safe_print(f"파일 업로드 요청: {filename}")
+            self.safe_print(f"파일 업로드 요청: {filename}", client_info=client_info)
             
             # 파일 쓰기 모드 설정
             mode = 'ab' if chunk_info.get('append_mode') else 'wb'
@@ -689,33 +774,33 @@ class RemoteServer:
             # 응답 전송
             response = {"status": "success", "message": "파일 업로드 성공"}
             if chunk_info.get('is_last', True):
-                self.safe_print(f"파일 업로드 완료: {filename}")
+                self.safe_print(f"파일 업로드 완료: {filename}", client_info=client_info)
             
             self.send_response(client_socket, response)
             
         except Exception as e:
-            self.safe_print(f"파일 업로드 실패: {filename} - {str(e)}")
+            self.safe_print(f"파일 업로드 실패: {filename} - {str(e)}", client_info=client_info)
             self.send_response(client_socket, {
                 "status": "error",
                 "message": f"파일 업로드 실패: {str(e)}"
             })
 
-    def handle_download(self, client_socket, data):
+    def handle_download(self, client_socket, data, client_info):
         """파일 다운로드 처리"""
         try:
             filename = data.get('filename')
-            self.safe_print(f"파일 다운로드 요청: {filename}")
+            self.safe_print(f"파일 다운로드 요청: {filename}", client_info=client_info)
             
             if not os.path.exists(filename):
                 raise FileNotFoundError("파일을 찾을 수 없습니다")
             
             file_size = os.path.getsize(filename)
-            self.safe_print(f"파일 크기: {file_size:,} 바이트")
+            self.safe_print(f"파일 크기: {file_size:,} 바이트", client_info=client_info)
             
             with open(filename, 'rb') as f:
                 content = base64.b64encode(f.read()).decode('utf-8')
             
-            self.safe_print(f"파일 다운로드 완료: {filename}")
+            self.safe_print(f"파일 다운로드 완료: {filename}", client_info=client_info)
             self.send_response(client_socket, {
                 "status": "success",
                 "content": content,
@@ -723,7 +808,7 @@ class RemoteServer:
             })
             
         except Exception as e:
-            self.safe_print(f"파일 다운로드 실패: {filename} - {str(e)}")
+            self.safe_print(f"파일 다운로드 실패: {filename} - {str(e)}", client_info=client_info)
             self.send_response(client_socket, {
                 "status": "error",
                 "message": f"파일 다운로드 실패: {str(e)}"
