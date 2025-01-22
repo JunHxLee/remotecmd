@@ -371,7 +371,15 @@ class RemoteServer:
         try:
             self.server.bind((self.host, self.port))
             self.server.listen(5)
+            self.server.settimeout(1)  # 타임아웃 설정
             print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
+            print("사용 가능한 명령어:")
+            print("- shutdown: 서버 종료")
+            
+            # 서버 명령어 처리를 위한 스레드 시작
+            command_thread = threading.Thread(target=self.handle_server_commands)
+            command_thread.daemon = True
+            command_thread.start()
             
             while self.running:
                 try:
@@ -387,6 +395,49 @@ class RemoteServer:
             print(f"서버 오류: {str(e)}")
         finally:
             self.cleanup()
+
+    def handle_server_commands(self):
+        """서버 명령어 처리"""
+        while self.running:
+            try:
+                command = input().strip().lower()
+                if command == 'shutdown':
+                    print("서버를 종료합니다...")
+                    self.running = False
+                    break
+            except:
+                pass
+
+    def cleanup(self):
+        """서버 자원 정리"""
+        self.running = False
+        try:
+            # 모든 클라이언트 연결 종료
+            for client in self.get_all_clients():
+                try:
+                    client.close()
+                except:
+                    pass
+            
+            # 서버 소켓 종료
+            self.server.close()
+            print("서버가 종료되었습니다.")
+        except:
+            pass
+
+    def get_all_clients(self):
+        """연결된 모든 클라이언트 소켓 반환"""
+        clients = []
+        for thread in threading.enumerate():
+            if thread.name.startswith('Thread-'):
+                if hasattr(thread, '_args'):
+                    if len(thread._args) > 0 and isinstance(thread._args[0], socket.socket):
+                        clients.append(thread._args[0])
+        return clients
+
+    def shutdown(self):
+        """서버 종료"""
+        self.running = False
 
     def handle_client(self, client_socket, addr):
         """클라이언트 요청 처리"""
@@ -528,15 +579,6 @@ class RemoteServer:
                 "status": "error",
                 "message": f"파일 다운로드 실패: {str(e)}"
             })
-
-    def cleanup(self):
-        """자원 정리"""
-        self.running = False
-        
-        try:
-            self.server.close()
-        except:
-            pass
 
 class RemoteClient:
     """클라이언트 클래스"""
