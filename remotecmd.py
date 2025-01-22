@@ -533,9 +533,13 @@ class RemoteServer:
             try:
                 command = input().strip().lower()
                 if command == 'shutdown':
-                    print("서버를 종료합니다...")
+                    print("\r서버를 종료합니다...", flush=True)
                     self.running = False
                     break
+            except KeyboardInterrupt:
+                print("\r\n서버를 종료합니다...", flush=True)
+                self.running = False
+                break
             except:
                 pass
 
@@ -552,7 +556,7 @@ class RemoteServer:
             
             # 서버 소켓 종료
             self.server.close()
-            print("서버가 종료되었습니다.")
+            print("\r서버가 종료되었습니다.", flush=True)
         except:
             pass
 
