@@ -11,6 +11,7 @@ import struct
 import select
 import time
 from contextlib import contextmanager
+import errno
 
 # 운영체제별 모듈 임포트
 if os.name == 'nt':  # Windows
@@ -53,6 +54,7 @@ class PtyHandler:
         self.process = None
         self.is_windows = os.name == 'nt'
         self.buffer = b''
+        self.interactive_commands = {'cat', 'nano', 'vi', 'vim', 'less', 'more', 'tail -f'}
         
     def create(self):
         """PTY 생성"""
@@ -61,7 +63,13 @@ class PtyHandler:
             # PTY 설정
             attr = termios.tcgetattr(self.slave_fd)
             attr[3] = attr[3] & ~termios.ECHO  # Echo 끄기
+            attr[0] = attr[0] | termios.ICRNL   # CR -> NL 변환
+            attr[1] = attr[1] | termios.ONLCR   # NL -> CR-NL 변환
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, attr)
+            
+            # 터미널 크기 설정
+            rows, cols = TerminalSize.get_terminal_size()
+            self.resize(rows, cols)
             return True
         return False
         
@@ -72,13 +80,18 @@ class PtyHandler:
             
         if self.is_windows:
             # Windows에서는 subprocess를 통해 실행
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
             self.process = subprocess.Popen(
                 shell,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                startupinfo=startupinfo,
+                bufsize=0
             )
             return True
         else:
@@ -86,7 +99,8 @@ class PtyHandler:
                 'TERM': 'xterm-256color',
                 'PATH': os.environ.get('PATH', ''),
                 'HOME': os.environ.get('HOME', ''),
-                'SHELL': shell
+                'SHELL': shell,
+                'LANG': os.environ.get('LANG', 'en_US.UTF-8')
             }
             
             self.process = subprocess.Popen(
@@ -106,22 +120,38 @@ class PtyHandler:
         if self.is_windows:
             if self.process:
                 try:
-                    # Windows에서는 stdout에서 직접 읽기
-                    data = self.process.stdout.read1(size)
-                    if data:
-                        return data
-                    # 에러 출력도 확인
-                    return self.process.stderr.read1(size)
+                    # Windows에서는 stdout과 stderr을 모두 확인
+                    output = b''
+                    
+                    # stdout 확인
+                    if self.process.stdout:
+                        try:
+                            data = self.process.stdout.read1(size)
+                            if data:
+                                output += data
+                        except (IOError, OSError):
+                            pass
+                            
+                    # stderr 확인
+                    if self.process.stderr:
+                        try:
+                            data = self.process.stderr.read1(size)
+                            if data:
+                                output += data
+                        except (IOError, OSError):
+                            pass
+                            
+                    return output if output else None
                 except:
                     return None
         else:
             if self.master_fd:
                 try:
                     # Unix/Linux에서는 master_fd에서 읽기
-                    data = os.read(self.master_fd, size)
-                    if data:
-                        return data
-                except:
+                    return os.read(self.master_fd, size)
+                except (IOError, OSError) as e:
+                    if e.errno != errno.EAGAIN:
+                        raise
                     return None
         return None
         
@@ -131,20 +161,22 @@ class PtyHandler:
             data = data.encode()
             
         if self.is_windows:
-            if self.process:
+            if self.process and self.process.stdin:
                 try:
                     # Windows에서는 stdin에 직접 쓰기
                     self.process.stdin.write(data)
                     self.process.stdin.flush()
                     return len(data)
-                except:
+                except (IOError, OSError):
                     return None
         else:
             if self.master_fd:
                 try:
                     # Unix/Linux에서는 master_fd에 쓰기
                     return os.write(self.master_fd, data)
-                except:
+                except (IOError, OSError) as e:
+                    if e.errno != errno.EAGAIN:
+                        raise
                     return None
         return None
 
@@ -155,6 +187,8 @@ class PtyHandler:
             b'\x03': self.handle_ctrl_c,  # Ctrl+C
             b'\x04': self.handle_ctrl_d,  # Ctrl+D
             b'\x1a': self.handle_ctrl_z,  # Ctrl+Z
+            b'\x1b': lambda: b'\x1b',     # ESC
+            b'\r': lambda: b'\r\n' if not self.is_windows else b'\r\n'  # Enter
         }
         
         if data in control_chars:
@@ -164,7 +198,7 @@ class PtyHandler:
     def handle_ctrl_c(self):
         """Ctrl+C 처리"""
         if self.is_windows:
-            os.kill(self.process.pid, signal.CTRL_C_EVENT)
+            self.process.send_signal(signal.CTRL_C_EVENT)
         else:
             os.kill(self.process.pid, signal.SIGINT)
         return b'^C\n'
@@ -178,7 +212,7 @@ class PtyHandler:
     def handle_ctrl_z(self):
         """Ctrl+Z 처리"""
         if self.is_windows:
-            os.kill(self.process.pid, signal.CTRL_BREAK_EVENT)
+            self.process.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             os.kill(self.process.pid, signal.SIGTSTP)
         return b'^Z\n'
@@ -187,7 +221,11 @@ class PtyHandler:
         """터미널 크기 조정"""
         if not self.is_windows and self.master_fd:
             winsize = struct.pack('HHHH', rows, cols, 0, 0)
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            try:
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            except (IOError, OSError) as e:
+                if e.errno != errno.EINVAL:
+                    raise
             
     def close(self):
         """세션 종료"""
@@ -272,6 +310,22 @@ class RemoteSession:
             processed_data = self.pty.handle_control_chars(data)
             if processed_data:
                 self.pty.write(processed_data)
+                # 대화형 명령어 처리를 위한 즉시 출력
+                if self.pty.is_windows:
+                    time.sleep(0.1)  # Windows에서 출력 동기화를 위한 짧은 대기
+                    output = self.pty.read(4096)
+                    if output:
+                        try:
+                            decoded_output = output.decode('utf-8', errors='replace')
+                            self.send_data({
+                                'type': 'output',
+                                'data': decoded_output
+                            })
+                        except UnicodeDecodeError:
+                            self.send_data({
+                                'type': 'output',
+                                'data': str(output)
+                            })
         elif command.get('type') == 'resize':
             self.pty.resize(command['rows'], command['cols'])
             
@@ -279,23 +333,26 @@ class RemoteSession:
         """셸 출력 처리"""
         try:
             while self.shell_mode and self.running:
-                if not self.is_windows:
-                    readable, _, _ = select.select([self.pty.master_fd], [], [], 0.1)
-                    if self.pty.master_fd in readable:
-                        data = self.pty.read(4096)
-                        if data:
-                            try:
-                                decoded_data = data.decode('utf-8', errors='replace')
-                                self.send_data({
-                                    'type': 'output',
-                                    'data': decoded_data
-                                })
-                            except UnicodeDecodeError:
-                                # 디코딩 오류 발생 시 raw 바이트로 전송
-                                self.send_data({
-                                    'type': 'output',
-                                    'data': str(data)
-                                })
+                if not self.pty.is_windows:
+                    try:
+                        readable, _, _ = select.select([self.pty.master_fd], [], [], 0.1)
+                        if self.pty.master_fd in readable:
+                            data = self.pty.read(4096)
+                            if data:
+                                try:
+                                    decoded_data = data.decode('utf-8', errors='replace')
+                                    self.send_data({
+                                        'type': 'output',
+                                        'data': decoded_data
+                                    })
+                                except UnicodeDecodeError:
+                                    self.send_data({
+                                        'type': 'output',
+                                        'data': str(data)
+                                    })
+                    except (select.error, IOError) as e:
+                        if e.args[0] != errno.EINTR:  # EINTR 오류 무시
+                            raise
                 else:
                     data = self.pty.read(4096)
                     if data:
@@ -306,13 +363,13 @@ class RemoteSession:
                                 'data': decoded_data
                             })
                         except UnicodeDecodeError:
-                            # 디코딩 오류 발생 시 raw 바이트로 전송
                             self.send_data({
                                 'type': 'output',
                                 'data': str(data)
                             })
                     time.sleep(0.01)
-        except:
+        except Exception as e:
+            print(f"셸 출력 처리 중 오류 발생: {str(e)}")
             self.shell_mode = False
             
     def handle_command(self, command):
