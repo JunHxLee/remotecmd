@@ -6,421 +6,536 @@ import os
 import json
 import base64
 import sys
+import signal
+import struct
+import select
+import time
 from contextlib import contextmanager
-import tqdm
+import msvcrt  # Windows용
 
-if os.name == 'nt':  # Windows인 경우
-    import ctypes
+# 운영체제별 모듈 임포트
+if os.name == 'nt':  # Windows
     import msvcrt
+    import ctypes
     kernel32 = ctypes.windll.kernel32
     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-else:  # Unix 계열인 경우
-    import pty
-    import select
-    import termios
-    import struct
+else:  # Unix/Linux
     import fcntl
+    import termios
+    import pty
     import tty
 
-class RemoteCommandExecutor:
+class TerminalSize:
+    """터미널 크기 관리 클래스"""
+    @staticmethod
+    def get_terminal_size():
+        if os.name == 'nt':
+            try:
+                from shutil import get_terminal_size
+                size = get_terminal_size()
+                return size.lines, size.columns
+            except:
+                return 24, 80
+        else:
+            try:
+                import fcntl
+                import termios
+                import struct
+                size = struct.unpack('hh', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, '1234'))
+                return size[0], size[1]
+            except:
+                return 24, 80
+
+class PtyHandler:
+    """PTY 세션 관리 클래스"""
+    def __init__(self):
+        self.master_fd = None
+        self.slave_fd = None
+        self.process = None
+        self.is_windows = os.name == 'nt'
+        
+    def create(self):
+        """PTY 생성"""
+        if not self.is_windows:
+            self.master_fd, self.slave_fd = pty.openpty()
+            # PTY 설정
+            attr = termios.tcgetattr(self.slave_fd)
+            attr[3] = attr[3] & ~termios.ECHO
+            termios.tcsetattr(self.slave_fd, termios.TCSANOW, attr)
+            return True
+        return False
+        
+    def spawn(self, shell=None):
+        """셸 프로세스 생성"""
+        if not shell:
+            shell = 'cmd.exe' if self.is_windows else '/bin/bash'
+            
+        if self.is_windows:
+            self.process = subprocess.Popen(
+                shell,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True
+            )
+            return True
+        else:
+            env = {
+                'TERM': 'xterm-256color',
+                'PATH': os.environ.get('PATH', ''),
+                'HOME': os.environ.get('HOME', ''),
+                'SHELL': shell
+            }
+            
+            self.process = subprocess.Popen(
+                shell,
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                preexec_fn=os.setsid,
+                env=env,
+                shell=False
+            )
+            os.close(self.slave_fd)
+            return True
+        
+    def resize(self, rows, cols):
+        """터미널 크기 조정"""
+        if not self.is_windows and self.master_fd:
+            winsize = struct.pack('HHHH', rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            
+    def read(self, size=1024):
+        """데이터 읽기"""
+        if self.is_windows:
+            if self.process:
+                try:
+                    return self.process.stdout.read1(size)
+                except:
+                    return None
+        else:
+            if self.master_fd:
+                try:
+                    return os.read(self.master_fd, size)
+                except:
+                    return None
+        return None
+        
+    def write(self, data):
+        """데이터 쓰기"""
+        if self.is_windows:
+            if self.process:
+                try:
+                    self.process.stdin.write(data)
+                    self.process.stdin.flush()
+                    return len(data)
+                except:
+                    return None
+        else:
+            if self.master_fd:
+                try:
+                    return os.write(self.master_fd, data)
+                except:
+                    return None
+        return None
+        
+    def close(self):
+        """세션 종료"""
+        if self.process:
+            try:
+                if self.is_windows:
+                    self.process.terminate()
+                else:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except:
+                pass
+            
+        if self.master_fd and not self.is_windows:
+            try:
+                os.close(self.master_fd)
+            except:
+                pass
+
+class RemoteSession:
+    """원격 세션 관리 클래스"""
+    def __init__(self, client_socket, addr):
+        self.client = client_socket
+        self.addr = addr
+        self.pty = PtyHandler()
+        self.running = True
+        self.shell_mode = False
+        
+    def start(self):
+        """세션 시작"""
+        thread = threading.Thread(target=self.handle_client)
+        thread.daemon = True
+        thread.start()
+        
+    def handle_client(self):
+        """클라이언트 요청 처리"""
+        try:
+            while self.running:
+                data = self.receive_data()
+                if not data:
+                    break
+                    
+                command = json.loads(data)
+                cmd_type = command.get('type', '')
+                
+                if cmd_type == 'shell' and not self.shell_mode:
+                    self.start_shell_mode()
+                elif self.shell_mode:
+                    self.handle_shell_input(command)
+                else:
+                    self.handle_command(command)
+                    
+        except Exception as e:
+            print(f"클라이언트 처리 중 오류: {str(e)}")
+        finally:
+            self.close()
+            
+    def start_shell_mode(self):
+        """셸 모드 시작"""
+        self.shell_mode = True
+        if self.pty.create() and self.pty.spawn():
+            # 입출력 스레드 시작
+            output_thread = threading.Thread(target=self.handle_shell_output)
+            output_thread.daemon = True
+            output_thread.start()
+            
+            self.send_data({
+                'type': 'shell',
+                'status': 'started'
+            })
+        else:
+            self.send_data({
+                'type': 'error',
+                'message': '셸 시작 실패'
+            })
+            self.shell_mode = False
+            
+    def handle_shell_input(self, command):
+        """셸 입력 처리"""
+        if command.get('type') == 'input':
+            self.pty.write(command['data'].encode())
+        elif command.get('type') == 'resize':
+            self.pty.resize(command['rows'], command['cols'])
+            
+    def handle_shell_output(self):
+        """셸 출력 처리"""
+        try:
+            while self.shell_mode and self.running:
+                if not self.is_windows:
+                    readable, _, _ = select.select([self.pty.master_fd], [], [], 0.1)
+                    if self.pty.master_fd in readable:
+                        data = self.pty.read(4096)
+                        if data:
+                            self.send_data({
+                                'type': 'output',
+                                'data': data.decode('utf-8', errors='replace')
+                            })
+                else:
+                    data = self.pty.read(4096)
+                    if data:
+                        self.send_data({
+                            'type': 'output',
+                            'data': data.decode('utf-8', errors='replace')
+                        })
+                    time.sleep(0.01)
+        except:
+            self.shell_mode = False
+            
+    def handle_command(self, command):
+        """일반 명령어 처리"""
+        cmd_type = command.get('type', '')
+        if cmd_type == 'exec':
+            self.handle_exec(command)
+        elif cmd_type == 'upload':
+            self.handle_upload(command)
+        elif cmd_type == 'download':
+            self.handle_download(command)
+            
+    def handle_exec(self, command):
+        """명령어 실행"""
+        try:
+            cmd = command.get('command', '')
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate()
+            
+            self.send_data({
+                'type': 'exec_result',
+                'stdout': stdout,
+                'stderr': stderr,
+                'code': process.returncode
+            })
+        except Exception as e:
+            self.send_data({
+                'type': 'error',
+                'message': str(e)
+            })
+            
+    def handle_upload(self, command):
+        """파일 업로드 처리"""
+        try:
+            filename = command.get('filename', '')
+            content = base64.b64decode(command.get('content', ''))
+            
+            with open(filename, 'wb') as f:
+                f.write(content)
+                
+            self.send_data({
+                'type': 'upload_result',
+                'status': 'success'
+            })
+        except Exception as e:
+            self.send_data({
+                'type': 'error',
+                'message': str(e)
+            })
+            
+    def handle_download(self, command):
+        """파일 다운로드 처리"""
+        try:
+            filename = command.get('filename', '')
+            
+            with open(filename, 'rb') as f:
+                content = base64.b64encode(f.read()).decode()
+                
+            self.send_data({
+                'type': 'download_result',
+                'filename': filename,
+                'content': content
+            })
+        except Exception as e:
+            self.send_data({
+                'type': 'error',
+                'message': str(e)
+            })
+            
+    def send_data(self, data):
+        """데이터 전송"""
+        try:
+            json_data = json.dumps(data)
+            size = len(json_data)
+            self.client.sendall(f"{size:08d}".encode())
+            self.client.sendall(json_data.encode())
+        except:
+            self.running = False
+            
+    def receive_data(self):
+        """데이터 수신"""
+        try:
+            size_data = self.client.recv(8)
+            if not size_data:
+                return None
+                
+            size = int(size_data.decode())
+            data = ""
+            
+            while len(data) < size:
+                chunk = self.client.recv(min(size - len(data), 4096)).decode()
+                if not chunk:
+                    return None
+                data += chunk
+                
+            return data
+        except:
+            return None
+            
+    def close(self):
+        """세션 종료"""
+        self.running = False
+        self.shell_mode = False
+        self.pty.close()
+        try:
+            self.client.close()
+        except:
+            pass
+
+class RemoteServer:
+    """서버 클래스"""
     def __init__(self, host='0.0.0.0', port=5000):
         self.host = host
         self.port = port
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.running = True  # 서버 실행 상태 플래그 추가
+        self.running = True
+        self.sessions = []
         
-    def start_server(self):
+    def start(self):
+        """서버 시작"""
         try:
             self.server.bind((self.host, self.port))
-            self.server.listen(1)
-            self.server.settimeout(1)  # 타임아웃 설정으로 주기적 체크 가능
-            print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
-            print("서버 종료를 위해서는 'shutdown' 명령어를 사용하세요.")
+            self.server.listen(5)
+            self.server.settimeout(1)
             
-            # 서버 종료 명령을 감시하는 스레드 시작
-            shutdown_thread = threading.Thread(target=self.check_shutdown_command)
+            print(f"서버가 {self.host}:{self.port}에서 실행 중입니다.")
+            print("사용 가능한 명령어:")
+            print("- shutdown: 서버 종료")
+            print("- list: 연결된 클라이언트 목록")
+            print("- kill <세션ID>: 특정 클라이언트 연결 종료")
+            
+            shutdown_thread = threading.Thread(target=self.check_shutdown)
             shutdown_thread.daemon = True
             shutdown_thread.start()
             
             while self.running:
                 try:
                     client, addr = self.server.accept()
-                    print(f"클라이언트 {addr}가 연결되었습니다.")
-                    client_thread = threading.Thread(target=self.handle_client, args=(client,))
-                    client_thread.daemon = True
-                    client_thread.start()
+                    print(f"클라이언트 {addr} 연결됨")
+                    
+                    session = RemoteSession(client, addr)
+                    self.sessions.append(session)
+                    session.start()
                 except socket.timeout:
                     continue
-                except Exception as e:
-                    if self.running:  # 정상 종료가 아닌 경우에만 에러 출력
-                        print(f"연결 수락 중 오류 발생: {str(e)}")
-            
-            print("서버가 종료되었습니다.")
-            
-        except Exception as e:
-            print(f"서버 시작 중 오류 발생: {str(e)}")
+                    
+        except KeyboardInterrupt:
+            print("\n서버를 종료합니다...")
         finally:
             self.cleanup()
-    
+            
+    def check_shutdown(self):
+        """서버 명령어 처리"""
+        while self.running:
+            try:
+                cmd = input().strip().lower()
+                if cmd == 'shutdown':
+                    print("서버를 종료합니다...")
+                    self.running = False
+                elif cmd == 'list':
+                    self.list_sessions()
+                elif cmd.startswith('kill '):
+                    self.kill_session(cmd[5:])
+            except:
+                pass
+                
+    def list_sessions(self):
+        """연결된 클라이언트 목록 출력"""
+        print("\n연결된 클라이언트 목록:")
+        for i, session in enumerate(self.sessions):
+            if session.running:
+                print(f"{i}: {session.addr[0]}:{session.addr[1]}")
+        print()
+                
+    def kill_session(self, session_id):
+        """특정 세션 종료"""
+        try:
+            idx = int(session_id)
+            if 0 <= idx < len(self.sessions):
+                session = self.sessions[idx]
+                if session.running:
+                    session.close()
+                    print(f"세션 {idx} ({session.addr[0]}:{session.addr[1]}) 종료됨")
+                else:
+                    print("이미 종료된 세션입니다.")
+            else:
+                print("잘못된 세션 ID입니다.")
+        except ValueError:
+            print("올바른 세션 ID를 입력하세요.")
+                
     def cleanup(self):
-        """서버 자원 정리"""
+        """자원 정리"""
+        self.running = False
+        
+        for session in self.sessions:
+            session.close()
+            
         try:
             self.server.close()
         except:
             pass
-    
-    def check_shutdown_command(self):
-        """서버 종료 명령을 감시하는 메서드"""
-        while self.running:
-            try:
-                command = input().strip().lower()
-                if command == 'shutdown':
-                    print("서버를 종료합니다...")
-                    self.shutdown()
-                    break
-            except:
-                pass
-    
-    def shutdown(self):
-        """서버를 안전하게 종료"""
-        self.running = False
-        # 서버 소켓을 닫아서 accept 블록을 해제
-        try:
-            # 로컬호스트로 더미 연결을 생성하여 accept 블록 해제
-            dummy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            dummy_socket.connect((self.host, self.port))
-            dummy_socket.close()
-        except:
-            pass
-    
-    def create_pty(self):
-        if platform.system() != 'Windows':
-            master_fd, slave_fd = pty.openpty()
-            return master_fd, slave_fd
-        return None, None
-    
-    def handle_client(self, client):
-        try:
-            master_fd, slave_fd = self.create_pty()
-            shell = '/bin/bash' if platform.system() != 'Windows' else 'cmd.exe'
-            
-            if platform.system() != 'Windows':
-                # PTY를 통한 셸 실행
-                process = subprocess.Popen(
-                    shell,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    preexec_fn=os.setsid,
-                    shell=False
-                )
-                os.close(slave_fd)
-            
-            while self.running:  # 서버 실행 상태 확인
-                try:
-                    size_data = client.recv(8).decode('utf-8')
-                    if not size_data:
-                        break
-                    
-                    total_size = int(size_data)
-                    received_data = ""
-                    
-                    while len(received_data) < total_size:
-                        chunk = client.recv(4096).decode('utf-8', errors='ignore')
-                        if not chunk:
-                            break
-                        received_data += chunk
-                    
-                    if not received_data:
-                        break
-                    
-                    command_data = json.loads(received_data)
-                    command_type = command_data.get('type', 'command')
-                    
-                    if command_type == 'terminal':
-                        # 터미널 모드 처리
-                        self.handle_terminal_mode(client, master_fd, command_data)
-                    elif command_type == 'command':
-                        if command_data.get('data', '').split()[0] in ['vi', 'vim', 'nano', 'less', 'more', 'cat']:
-                            # 대화형 명령어는 터미널 모드로 처리
-                            self.handle_interactive_command(client, master_fd, command_data.get('data', ''))
-                        else:
-                            response = self.execute_command(command_data.get('data', ''))
-                            self.send_response(client, response)
-                    elif command_type in ['upload', 'download', 'download_info']:
-                        response = self.handle_file_transfer(command_type, command_data)
-                        self.send_response(client, response)
-                    
-                except json.JSONDecodeError as e:
-                    if self.running:  # 정상 종료가 아닌 경우에만 에러 응답
-                        self.send_response(client, {
-                            "status": "error",
-                            "message": f"잘못된 명령어 형식입니다: {str(e)}"
-                        })
-                    
-        except Exception as e:
-            if self.running:  # 정상 종료가 아닌 경우에만 에러 출력
-                print(f"클라이언트 처리 중 오류 발생: {str(e)}")
-        finally:
-            if master_fd is not None:
-                try:
-                    os.close(master_fd)
-                except:
-                    pass
-            try:
-                client.close()
-            except:
-                pass
-    
-    def handle_terminal_mode(self, client, master_fd, command_data):
-        if platform.system() == 'Windows':
-            return
-            
-        input_data = command_data.get('input', '')
-        window_size = command_data.get('window_size')
-        
-        if window_size:
-            # 터미널 윈도우 크기 설정
-            winsize = struct.pack('HHHH', window_size['rows'], window_size['cols'], 0, 0)
-            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-        
-        if input_data:
-            os.write(master_fd, input_data.encode())
-        
-        # 출력 읽기
-        readable, _, _ = select.select([master_fd], [], [], 0.1)
-        if master_fd in readable:
-            try:
-                output = os.read(master_fd, 1024)
-                self.send_response(client, {
-                    "status": "success",
-                    "type": "terminal_output",
-                    "data": output.decode('utf-8', errors='replace')
-                })
-            except OSError:
-                pass
-
-    def send_response(self, client, response):
-        response_json = json.dumps(response)
-        size_str = f"{len(response_json):08d}"
-        client.send(size_str.encode('utf-8'))
-        client.send(response_json.encode('utf-8'))
-
-    def execute_command(self, command):
-        try:
-            if platform.system() == 'Windows':
-                if command.lower().startswith('cd '):
-                    try:
-                        os.chdir(command[3:].strip())
-                        output = os.getcwd()
-                        error = None
-                    except Exception as e:
-                        output = ''
-                        error = str(e)
-                else:
-                    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    output, error = process.communicate(timeout=30)
-            else:
-                process = subprocess.Popen(['/bin/bash', '-c', command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                output, error = process.communicate(timeout=30)
-            
-            if error:
-                return {"status": "error", "message": error}
-            return {"status": "success", "message": output or os.getcwd()}
-            
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-    
-    def handle_file_transfer(self, command_type, command_data):
-        try:
-            filename = command_data.get('filename')
-            
-            if command_type == 'download_info':
-                return {
-                    "status": "success",
-                    "message": "파일 정보",
-                    "file_size": os.path.getsize(filename)
-                }
-            
-            if command_type == 'download':
-                chunk_info = command_data.get('chunk_info', {})
-                offset = chunk_info.get('offset', 0)
-                size = chunk_info.get('size', 0)
-                
-                with open(filename, 'rb') as f:
-                    f.seek(offset)
-                    content = f.read(size)
-                
-                return {
-                    "status": "success",
-                    "message": "청크 다운로드 완료",
-                    "content": base64.b64encode(content).decode('utf-8')
-                }
-            
-            if command_type == 'upload':
-                chunk_info = command_data.get('chunk_info', {})
-                is_last = chunk_info.get('is_last', True)
-                append_mode = chunk_info.get('append_mode', False)
-                
-                file_content = base64.b64decode(command_data.get('content'))
-                
-                mode = 'ab' if append_mode else 'wb'
-                with open(filename, mode) as f:
-                    f.write(file_content)
-                
-                if is_last:
-                    return {"status": "success", "message": f"파일 '{filename}' 업로드 완료"}
-                return {"status": "success", "message": "청크 업로드 완료"}
-            
-        except Exception as e:
-            return {"status": "error", "message": f"파일 전송 실패: {str(e)}"}
-
-    def handle_interactive_command(self, client, master_fd, command):
-        if platform.system() == 'Windows':
-            return self.execute_command(command)
-            
-        try:
-            # 명령어 실행
-            os.write(master_fd, f"{command}\n".encode())
-            
-            while True:
-                readable, _, _ = select.select([master_fd], [], [], 0.1)
-                if master_fd in readable:
-                    try:
-                        output = os.read(master_fd, 1024)
-                        if output:
-                            self.send_response(client, {
-                                "status": "success",
-                                "type": "terminal_output",
-                                "data": output.decode('utf-8', errors='replace')
-                            })
-                    except OSError:
-                        break
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
 class RemoteClient:
+    """클라이언트 클래스"""
     def __init__(self, host='localhost', port=5000):
         self.host = host
         self.port = port
-        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.client.settimeout(60)
-        self.terminal_mode = False
-        self.interactive_commands = ['vi', 'vim', 'nano', 'less', 'more', 'cat']
-        
-    @contextmanager
-    def raw_mode(self):
-        if platform.system() != 'Windows':
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                yield
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        else:
-            yield
-    
-    def get_terminal_size(self):
-        try:
-            if platform.system() != 'Windows':
-                import fcntl
-                import termios
-                import struct
-                h, w = struct.unpack('HHHH', 
-                    fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))[:2]
-                return type('TerminalSize', (), {'columns': w, 'lines': h})()
-            else:
-                from shutil import get_terminal_size
-                size = get_terminal_size()
-                return type('TerminalSize', (), {'columns': size.columns, 'lines': size.lines})()
-        except:
-            return type('TerminalSize', (), {'columns': 80, 'lines': 24})()
-    
-    def handle_terminal_mode(self):
-        with self.raw_mode():
-            while self.terminal_mode:
-                # 터미널 크기 전송
-                size = self.get_terminal_size()
-                self.send_terminal_data('', {'rows': size.lines, 'cols': size.columns})
-                
-                if platform.system() != 'Windows':
-                    readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-                    if sys.stdin in readable:
-                        char = sys.stdin.read(1)
-                        if char == '\x1c':  # Ctrl+\
-                            self.terminal_mode = False
-                            break
-                        self.send_terminal_data(char)
-                else:
-                    if msvcrt.kbhit():
-                        char = msvcrt.getch().decode()
-                        if char == '\x1c':  # Ctrl+\
-                            self.terminal_mode = False
-                            break
-                        self.send_terminal_data(char)
-                
-                response = self.receive_response()
-                if response.get('type') == 'terminal_output':
-                    sys.stdout.write(response.get('data', ''))
-                    sys.stdout.flush()
-    
-    def send_terminal_data(self, input_data, window_size=None):
-        data = {
-            "type": "terminal",
-            "input": input_data
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.running = False
+        self.command_handlers = {
+            'put': self.handle_upload,
+            'get': self.handle_download,
+            'help': self.show_help,
+            'exit': self.handle_exit
         }
-        if window_size:
-            data["window_size"] = window_size
-        self.send_and_receive(data, show_response=False)
-    
-    def show_progress(self, total):
-        return tqdm.tqdm(
-            total=total,
-            unit='B',
-            unit_scale=True,
-            unit_divisor=1024,
-            leave=False,
-            ncols=100,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]'
-        )
-
+        
+    def get_command(self):
+        """사용자 입력을 직접 처리"""
+        current_path = self.get_current_path()
+        print(f"{current_path}> ", end='', flush=True)
+        
+        command = []
+        while True:
+            if os.name == 'nt':
+                # Windows
+                if msvcrt.kbhit():
+                    char = msvcrt.getch()
+                    if char == b'\r':  # Enter
+                        print()  # 새 줄
+                        break
+                    elif char == b'\x03':  # Ctrl+C
+                        raise KeyboardInterrupt
+                    elif char == b'\x08':  # Backspace
+                        if command:
+                            command.pop()
+                            print('\b \b', end='', flush=True)
+                    else:
+                        try:
+                            char_decoded = char.decode('utf-8')
+                            command.append(char_decoded)
+                            print(char_decoded, end='', flush=True)
+                        except:
+                            pass
+            else:
+                # Unix
+                char = sys.stdin.read(1)
+                if char == '\n':
+                    print()
+                    break
+                elif char == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt
+                command.append(char)
+                print(char, end='', flush=True)
+        
+        return ''.join(command).strip()
+        
     def connect(self):
         try:
-            self.client.connect((self.host, self.port))
+            self.socket.connect((self.host, self.port))
             print(f"서버 {self.host}:{self.port}에 연결되었습니다.")
-            print("원격 명령 프롬프트에 오신 것을 환영합니다.")
-            print("사용 가능한 명령어:")
-            print("- 일반 명령어: 시스템 명령어 실행")
-            print("- vi, nano 등: 대화형 편집기 사용 가능")
-            print("- upload <로컬파일> <원격파일>: 파일 업로드")
-            print("- download <원격파일> <로컬파일>: 파일 다운로드")
-            print("- exit: 프로그램 종료")
+            self.show_help()
             
             while True:
                 try:
-                    current_path = self.get_current_path()
-                    command = input(f"{current_path}> ")
-                    if command.lower() == 'exit':
-                        break
+                    command = self.get_command()
                     
-                    if command.strip() == '':
+                    if not command:
                         continue
                     
-                    if command.startswith('upload '):
-                        self.handle_upload_command(command)
-                    elif command.startswith('download '):
-                        self.handle_download_command(command)
+                    # 명령어와 인자 분리
+                    parts = command.split(maxsplit=1)
+                    cmd = parts[0].lower()
+                    args = parts[1] if len(parts) > 1 else ""
+                    
+                    # 내부 명령어 처리
+                    if cmd in self.command_handlers:
+                        if self.command_handlers[cmd](args) == False:
+                            break
                     else:
-                        # 대화형 명령어 확인
-                        cmd = command.split()[0]
-                        if cmd in self.interactive_commands:
-                            self.handle_interactive_mode(command)
-                        else:
-                            self.send_command(command)
+                        # 일반 명령어 처리
+                        self.send_command(command)
                     
                 except socket.timeout:
                     print("서버 응답 시간 초과")
+                except KeyboardInterrupt:
+                    print("\n프로그램을 종료합니다...")
+                    break
                 except Exception as e:
                     print(f"명령어 실행 중 오류 발생: {str(e)}")
                     break
@@ -428,207 +543,142 @@ class RemoteClient:
         except Exception as e:
             print(f"연결 오류: {str(e)}")
         finally:
-            self.client.close()
-    
-    def send_command(self, command):
-        command_data = {
-            "type": "command",
-            "data": command
-        }
-        self.send_and_receive(command_data)
-    
-    def handle_upload_command(self, command):
+            self.socket.close()
+
+    def handle_exit(self, _):
+        """종료 처리"""
+        return False
+
+    def show_help(self, _=None):
+        """도움말 표시"""
+        print("\n사용 가능한 명령어:")
+        print("1. 파일 전송")
+        print("  - put <로컬파일> <원격파일>  : 파일 업로드")
+        print("  - get <원격파일> <로컬파일>  : 파일 다운로드")
+        print("\n2. 시스템 명령어")
+        print("  - 모든 일반 시스템 명령어 사용 가능")
+        print("\n3. 기타")
+        print("  - help  : 이 도움말 보기")
+        print("  - exit  : 프로그램 종료\n")
+        return True
+
+    def handle_upload(self, args):
+        """파일 업로드 처리"""
         try:
-            parts = command.split()
-            if len(parts) != 3:
-                print("사용법: upload <로컬파일> <원격파일>")
-                return
+            parts = args.split()
+            if len(parts) != 2:
+                print("사용법: put <로컬파일> <원격파일>")
+                return True
             
-            local_file = parts[1]
-            remote_file = parts[2]
+            local_file = parts[0]
+            remote_file = parts[1]
             
             if not os.path.exists(local_file):
                 print("로컬 파일을 찾을 수 없습니다.")
-                return
+                return True
             
             file_size = os.path.getsize(local_file)
+            print(f"파일 크기: {file_size:,} 바이트")
             
-            with open(local_file, 'rb') as f, self.show_progress(file_size) as pbar:
-                chunk_size = 1024 * 1024  # 1MB
-                uploaded_size = 0
-                
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    
-                    uploaded_size += len(chunk)
-                    content = base64.b64encode(chunk).decode('utf-8')
-                    
-                    command_data = {
-                        "type": "upload",
-                        "filename": remote_file,
-                        "content": content,
-                        "chunk_info": {
-                            "is_last": len(chunk) < chunk_size,
-                            "append_mode": uploaded_size > chunk_size
-                        }
-                    }
-                    
-                    response = self.send_and_receive(command_data, show_response=False)
-                    if response.get("status") == "error":
-                        raise Exception(response.get("message"))
-                    
-                    pbar.update(len(chunk))
+            with open(local_file, 'rb') as f:
+                content = base64.b64encode(f.read()).decode('utf-8')
             
-            print(f"\r파일 '{local_file}' 업로드 완료")
+            command_data = {
+                "type": "upload",
+                "filename": remote_file,
+                "content": content
+            }
+            
+            response = self.send_and_receive(command_data)
+            if response.get("status") == "success":
+                print(f"파일 '{local_file}' 업로드 완료")
+            else:
+                print(f"업로드 실패: {response.get('message')}")
             
         except Exception as e:
-            print(f"\r파일 업로드 실패: {str(e)}")
-    
-    def handle_download_command(self, command):
+            print(f"파일 업로드 실패: {str(e)}")
+        return True
+
+    def handle_download(self, args):
+        """파일 다운로드 처리"""
         try:
-            parts = command.split()
-            if len(parts) != 3:
-                print("사용법: download <원격파일> <로컬파일>")
-                return
+            parts = args.split()
+            if len(parts) != 2:
+                print("사용법: get <원격파일> <로컬파일>")
+                return True
             
-            remote_file = parts[1]
-            local_file = parts[2]
+            remote_file = parts[0]
+            local_file = parts[1]
             
-            # 파일 정보 요청
             command_data = {
-                "type": "download_info",
+                "type": "download",
                 "filename": remote_file
             }
             
             response = self.send_and_receive(command_data)
-            if response.get("status") == "error":
-                print(f"파일 다운로드 실패: {response.get('message')}")
-                return
-                
-            file_size = response.get("file_size", 0)
-            print(f"\033[G\033[K파일 크기: {file_size:,} 바이트", end='')
             
-            # 청크 단위로 다운로드
-            chunk_size = 1024 * 1024  # 1MB
-            downloaded_size = 0
-            
-            with open(local_file, 'wb') as f:
-                while downloaded_size < file_size:
-                    command_data = {
-                        "type": "download",
-                        "filename": remote_file,
-                        "chunk_info": {
-                            "offset": downloaded_size,
-                            "size": chunk_size
-                        }
-                    }
-                    
-                    response = self.send_and_receive(command_data, show_response=False)
-                    if response.get("status") == "error":
-                        raise Exception(response.get("message"))
-                    
-                    chunk = base64.b64decode(response.get("content"))
-                    f.write(chunk)
-                    
-                    downloaded_size += len(chunk)
-                    self.show_progress(file_size)
-            
-            # 완료 메시지
-            print(f"\033[G\033[K파일 '{local_file}' 다운로드 완료")
+            if response.get("status") == "success":
+                content = base64.b64decode(response.get("content"))
+                with open(local_file, 'wb') as f:
+                    f.write(content)
+                print(f"파일 '{local_file}' 다운로드 완료")
+            else:
+                print(f"다운로드 실패: {response.get('message')}")
                 
         except Exception as e:
-            print(f"\033[G\033[K파일 다운로드 실패: {str(e)}")
-            if os.path.exists(local_file):
-                os.remove(local_file)  # 실패한 경우 불완전한 파일 삭제
-    
-    def send_and_receive(self, data, show_response=True):
+            print(f"파일 다운로드 실패: {str(e)}")
+        return True
+
+    def send_and_receive(self, command_data):
+        """데이터 전송 및 수신"""
         try:
-            # 데이터 전송
-            json_data = json.dumps(data)
-            size_str = f"{len(json_data):08d}"
-            self.client.send(size_str.encode('utf-8'))
-            self.client.send(json_data.encode('utf-8'))
+            json_data = json.dumps(command_data)
+            size = len(json_data)
+            self.socket.sendall(f"{size:08d}".encode())
+            self.socket.sendall(json_data.encode())
             
-            # 응답 수신
-            size_data = self.client.recv(8).decode('utf-8')
+            size_data = self.socket.recv(8)
             if not size_data:
-                raise Exception("서버로부터 응답을 받지 못했습니다.")
+                return None
                 
-            total_size = int(size_data)
-            received_data = ""
+            size = int(size_data.decode())
+            data = ""
             
-            while len(received_data) < total_size:
-                chunk = self.client.recv(4096).decode('utf-8')
+            while len(data) < size:
+                chunk = self.socket.recv(min(size - len(data), 4096)).decode()
                 if not chunk:
-                    break
-                received_data += chunk
-            
-            response_data = json.loads(received_data)
-            
-            if show_response:
-                if response_data.get("status") == "error":
-                    print(f"오류: {response_data.get('message')}")
-                else:
-                    print(response_data.get("message", ""))
-            
-            return response_data
-            
-        except Exception as e:
-            print(f"통신 오류: {str(e)}")
-            return {"status": "error", "message": str(e)}
-    
+                    return None
+                data += chunk
+                
+            return json.loads(data)
+        except:
+            return None
+
     def get_current_path(self):
-        command_data = {
-            "type": "command",
-            "data": "cd" if platform.system() == "Windows" else "pwd"
-        }
-        response = self.send_and_receive(command_data)
-        return response.get("message", "").strip()
+        """현재 경로 가져오기"""
+        if platform.system() != 'Windows':
+            return os.getcwd()
+        else:
+            return os.path.dirname(os.path.abspath(__file__))
 
-    def handle_interactive_mode(self, command):
-        print("대화형 모드 시작 (종료: Ctrl+C)")
-        self.terminal_mode = True
+def main():
+    """메인 함수"""
+    if len(sys.argv) > 1:
+        # 클라이언트 모드
+        if sys.argv[1] == 'client':
+            print("클라이언트 모드로 시작합니다...")
+            host = input("서버 IP 주소 (기본: localhost): ").strip() or 'localhost'
+            client = RemoteClient(host=host)
+            client.connect()
+    else:
+        # 서버 모드 (기본)
+        print("서버 모드로 시작합니다...")
+        server = RemoteServer()
         try:
-            with self.raw_mode():
-                self.send_command(command)
-                while self.terminal_mode:
-                    if platform.system() != 'Windows':
-                        if select.select([sys.stdin], [], [], 0.1)[0]:
-                            char = sys.stdin.read(1)
-                            if char == '\x03':  # Ctrl+C
-                                self.terminal_mode = False
-                                break
-                            self.send_terminal_data(char)
-                    else:
-                        if msvcrt.kbhit():
-                            char = msvcrt.getch()
-                            if char == b'\x03':  # Ctrl+C
-                                self.terminal_mode = False
-                                break
-                            self.send_terminal_data(char.decode(errors='ignore'))
-                    
-                    response = self.receive_response()
-                    if response.get('type') == 'terminal_output':
-                        sys.stdout.write(response.get('data', ''))
-                        sys.stdout.flush()
-        except KeyboardInterrupt:
-            self.terminal_mode = False
-            print("\n대화형 모드 종료")
-
-# 서버 실행 예시
-if __name__ == "__main__":
-    is_server = input("서버로 실행하시겠습니까? (y/n): ").lower() == 'y'
-    
-    if is_server:
-        server = RemoteCommandExecutor()
-        try:
-            server.start_server()
+            server.start()
         except KeyboardInterrupt:
             print("\n서버를 종료합니다...")
             server.shutdown()
-    else:
-        server_host = input("서버 IP를 입력하세요: ")
-        client = RemoteClient(host=server_host)
-        client.connect()
+
+if __name__ == "__main__":
+    main()
