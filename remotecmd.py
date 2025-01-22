@@ -327,7 +327,10 @@ class RemoteSession:
                                 'data': str(output)
                             })
         elif command.get('type') == 'resize':
-            self.pty.resize(command['rows'], command['cols'])
+            # 터미널 크기 조정
+            rows = command.get('rows', 24)
+            cols = command.get('cols', 80)
+            self.pty.resize(rows, cols)
             
     def handle_shell_output(self):
         """셸 출력 처리"""
@@ -730,15 +733,132 @@ class RemoteClient:
         self.host = host
         self.port = port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)  # 연결 유지
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.running = False
+        self.shell_mode = False
+        self.old_terminal_settings = None
         self.command_handlers = {
             'upload': self.handle_upload,
             'download': self.handle_download,
             'help': self.show_help,
-            'exit': self.handle_exit
+            'exit': self.handle_exit,
+            'shell': self.start_shell_mode
         }
-        
+
+    def setup_terminal(self):
+        """터미널을 raw 모드로 설정"""
+        if os.name != 'nt':
+            self.old_terminal_settings = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+        else:
+            # Windows의 경우 가상 터미널 모드 설정
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-10), 0x0001 | 0x0002 | 0x0004)
+
+    def restore_terminal(self):
+        """터미널 설정 복원"""
+        if os.name != 'nt' and self.old_terminal_settings:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_terminal_settings)
+        elif os.name == 'nt':
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-10), 0x0007)
+
+    def start_shell_mode(self):
+        """셸 모드 시작"""
+        try:
+            self.shell_mode = True
+            self.setup_terminal()
+            
+            # 서버에 셸 모드 시작 요청
+            self.send_and_receive({"type": "shell"})
+            
+            # 터미널 크기 전송
+            self.send_terminal_size()
+            
+            # 입력 처리 스레드 시작
+            input_thread = threading.Thread(target=self.handle_shell_input)
+            input_thread.daemon = True
+            input_thread.start()
+            
+            # 터미널 크기 변경 감지 스레드 시작
+            resize_thread = threading.Thread(target=self.handle_terminal_resize)
+            resize_thread.daemon = True
+            resize_thread.start()
+            
+            # 출력 처리
+            self.handle_shell_output()
+            
+        except Exception as e:
+            print(f"\r\n셸 모드 시작 실패: {str(e)}")
+        finally:
+            self.shell_mode = False
+            self.restore_terminal()
+
+    def send_terminal_size(self):
+        """터미널 크기 정보 전송"""
+        try:
+            rows, cols = TerminalSize.get_terminal_size()
+            self.send_and_receive({
+                "type": "resize",
+                "rows": rows,
+                "cols": cols
+            })
+        except Exception as e:
+            print(f"\r\n터미널 크기 전송 실패: {str(e)}")
+
+    def handle_terminal_resize(self):
+        """터미널 크기 변경 감지 및 처리"""
+        last_size = None
+        try:
+            while self.shell_mode:
+                current_size = TerminalSize.get_terminal_size()
+                if current_size != last_size:
+                    last_size = current_size
+                    rows, cols = current_size
+                    self.send_and_receive({
+                        "type": "resize",
+                        "rows": rows,
+                        "cols": cols
+                    })
+                time.sleep(0.5)  # 0.5초마다 크기 확인
+        except Exception as e:
+            print(f"\r\n터미널 크기 처리 오류: {str(e)}")
+
+    def handle_shell_input(self):
+        """셸 입력 처리"""
+        try:
+            while self.shell_mode:
+                if os.name == 'nt':
+                    if msvcrt.kbhit():
+                        char = msvcrt.getch()
+                        self.send_and_receive({
+                            "type": "input",
+                            "data": char.decode('utf-8', errors='ignore')
+                        })
+                else:
+                    char = sys.stdin.read(1)
+                    if char:
+                        self.send_and_receive({
+                            "type": "input",
+                            "data": char
+                        })
+        except Exception as e:
+            print(f"\r\n입력 처리 오류: {str(e)}")
+            self.shell_mode = False
+
+    def handle_shell_output(self):
+        """셸 출력 처리"""
+        try:
+            while self.shell_mode:
+                response = self.receive_response()
+                if response.get("type") == "output":
+                    sys.stdout.write(response["data"])
+                    sys.stdout.flush()
+                elif response.get("type") == "error":
+                    print(f"\r\n오류: {response.get('message')}")
+                    break
+        except Exception as e:
+            print(f"\r\n출력 처리 오류: {str(e)}")
+            self.shell_mode = False
+
     def connect(self):
         try:
             self.socket.connect((self.host, self.port))
@@ -746,6 +866,7 @@ class RemoteClient:
             print("원격 명령 프롬프트에 오신 것을 환영합니다.")
             print("- 종료: exit")
             print("- 도움말: help")
+            print("- 셸 모드: shell")
             print("- 로컬 명령어: !명령어 (예: !dir)")
             
             # 초기 프롬프트 수신
@@ -754,42 +875,56 @@ class RemoteClient:
             
             while True:
                 try:
-                    command = input(current_prompt).strip()
-                    
-                    if not command:
-                        continue
-                    
-                    # 내부 명령어 처리
-                    if command == "exit":
-                        break
-                    elif command == "help":
-                        self.show_help()
-                    elif command.startswith("upload "):
-                        self.handle_upload(command[7:])
-                    elif command.startswith("download "):
-                        self.handle_download(command[9:])
-                    elif command.startswith("!"):  # 로컬 명령어 처리
-                        self.execute_local_command(command[1:])
-                    else:
-                        # 일반 명령어를 서버로 전송
-                        response = self.send_and_receive({
-                            "type": "command",
-                            "data": command
-                        })
-                        current_prompt = response.get("prompt", current_prompt)
+                    if not self.shell_mode:
+                        command = input(current_prompt).strip()
+                        
+                        if not command:
+                            continue
+                        
+                        # 내부 명령어 처리
+                        if command == "exit":
+                            break
+                        elif command == "help":
+                            self.show_help()
+                        elif command == "shell":
+                            self.start_shell_mode()
+                        elif command.startswith("upload "):
+                            self.handle_upload(command[7:])
+                        elif command.startswith("download "):
+                            self.handle_download(command[9:])
+                        elif command.startswith("!"):  # 로컬 명령어 처리
+                            self.execute_local_command(command[1:])
+                        else:
+                            # 일반 명령어를 서버로 전송
+                            response = self.send_and_receive({
+                                "type": "command",
+                                "data": command
+                            })
+                            current_prompt = response.get("prompt", current_prompt)
                     
                 except socket.timeout:
                     print("서버 응답 시간 초과")
                 except KeyboardInterrupt:
-                    print("\n프로그램을 종료합니다...")
-                    break
+                    if self.shell_mode:
+                        # 셸 모드에서는 Ctrl+C를 서버로 전송
+                        self.send_and_receive({
+                            "type": "input",
+                            "data": "\x03"
+                        })
+                    else:
+                        print("\n프로그램을 종료합니다...")
+                        break
                 except Exception as e:
                     print(f"명령어 실행 중 오류 발생: {str(e)}")
+                    if self.shell_mode:
+                        self.shell_mode = False
+                        self.restore_terminal()
                     break
                     
         except Exception as e:
             print(f"연결 오류: {str(e)}")
         finally:
+            self.restore_terminal()
             self.socket.close()
 
     def execute_local_command(self, command):
